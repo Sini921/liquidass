@@ -1,0 +1,9 @@
+Package: dylv.liquidass
+Name: liquidass
+Version: 5.1.testers
+Architecture: iphoneos-arm
+Description: ass
+Maintainer: dylv
+Author: dylv
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0), preferenceloader, ldid
