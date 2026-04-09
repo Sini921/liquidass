@@ -1,4 +1,4 @@
-# build for a real device then: make package ARCHS="arm64 arm64e" TARGET="iphone:clang:latest:14.0" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless/rootful/roothide
+# build for a real device then: make package ARCHS="arm64 arm64e" TARGET="iphone:clang:latest:14.0" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless/roothide
 
 export TARGET := simulator:clang:latest:14.0
 export ARCHS := x86_64
