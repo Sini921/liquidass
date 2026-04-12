@@ -8,7 +8,6 @@ This tweak is incomplete, issues WILL happen.
 > contributions to this tweak are welcomed.
 
 this tweak compared to that LiquidGlassKit based tweak is missing a lot of things including:
-- music player
 - passcode buttons
 - control center
 - etc i havent even tried that tweak out yet
