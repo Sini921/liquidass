@@ -1,11 +1,10 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
 static const NSInteger kWidgetTintTag       = 0x71D0;
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 
-static void LGStartWidgetDisplayLink(void);
-static void LGStopWidgetDisplayLink(void);
 static void LGWidgetsRefreshAllHosts(void);
 static void *kWidgetAttachedKey = &kWidgetAttachedKey;
 static void *kWidgetGlassKey = &kWidgetGlassKey;
@@ -15,41 +14,21 @@ static void *kWidgetOriginalCornerRadiusKey = &kWidgetOriginalCornerRadiusKey;
 static void *kWidgetOriginalClipsKey = &kWidgetOriginalClipsKey;
 static void *kWidgetOriginalCornerCurveKey = &kWidgetOriginalCornerCurveKey;
 
-@interface LGWidgetTicker : NSObject
-- (void)tick:(CADisplayLink *)dl;
-@end
-
-@implementation LGWidgetTicker
-- (void)tick:(CADisplayLink *)dl {
-    LG_updateRegisteredGlassViews(LGUpdateGroupWidgets);
-}
-@end
-
 static CADisplayLink *sWidgetLink = nil;
-static LGWidgetTicker *sWidgetTicker = nil;
+static id sWidgetTicker = nil;
 static NSInteger sWidgetCount = 0;
 
-static BOOL LGWidgetEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"Widgets.Enabled", NO); }
-static CGFloat LGWidgetCornerRadius(void) { return LG_prefFloat(@"Widgets.CornerRadius", 20.2); }
-static CGFloat LGWidgetBezelWidth(void) { return LG_prefFloat(@"Widgets.BezelWidth", 18.0); }
-static CGFloat LGWidgetGlassThickness(void) { return LG_prefFloat(@"Widgets.GlassThickness", 150.0); }
-static CGFloat LGWidgetRefractionScale(void) { return LG_prefFloat(@"Widgets.RefractionScale", 1.8); }
-static CGFloat LGWidgetRefractiveIndex(void) { return LG_prefFloat(@"Widgets.RefractiveIndex", 1.2); }
-static CGFloat LGWidgetSpecularOpacity(void) { return LG_prefFloat(@"Widgets.SpecularOpacity", 0.8); }
-static CGFloat LGWidgetBlur(void) { return LG_prefFloat(@"Widgets.Blur", 8.0); }
-static CGFloat LGWidgetWallpaperScale(void) { return LG_prefFloat(@"Widgets.WallpaperScale", 0.5); }
-static CGFloat LGWidgetLightTintAlpha(void) { return LG_prefFloat(@"Widgets.LightTintAlpha", 0.1); }
-static CGFloat LGWidgetDarkTintAlpha(void) { return LG_prefFloat(@"Widgets.DarkTintAlpha", 0.3); }
-
-static NSInteger LGWidgetPreferredFPS(void) {
-    NSInteger maxFPS = UIScreen.mainScreen.maximumFramesPerSecond > 0
-        ? UIScreen.mainScreen.maximumFramesPerSecond
-        : 60;
-    NSInteger fps = LG_prefInteger(@"Homescreen.FPS", maxFPS >= 120 ? 120 : 60);
-    if (fps < 30) fps = 30;
-    if (fps > maxFPS) fps = maxFPS;
-    return fps;
-}
+LG_ENABLED_BOOL_PREF_FUNC(LGWidgetEnabled, "Widgets.Enabled", NO)
+LG_FLOAT_PREF_FUNC(LGWidgetCornerRadius, "Widgets.CornerRadius", 20.2)
+LG_FLOAT_PREF_FUNC(LGWidgetBezelWidth, "Widgets.BezelWidth", 18.0)
+LG_FLOAT_PREF_FUNC(LGWidgetGlassThickness, "Widgets.GlassThickness", 150.0)
+LG_FLOAT_PREF_FUNC(LGWidgetRefractionScale, "Widgets.RefractionScale", 1.8)
+LG_FLOAT_PREF_FUNC(LGWidgetRefractiveIndex, "Widgets.RefractiveIndex", 1.2)
+LG_FLOAT_PREF_FUNC(LGWidgetSpecularOpacity, "Widgets.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGWidgetBlur, "Widgets.Blur", 8.0)
+LG_FLOAT_PREF_FUNC(LGWidgetWallpaperScale, "Widgets.WallpaperScale", 0.5)
+LG_FLOAT_PREF_FUNC(LGWidgetLightTintAlpha, "Widgets.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGWidgetDarkTintAlpha, "Widgets.DarkTintAlpha", 0.3)
 
 static BOOL LGViewBelongsToWidgetStack(UIView *view) {
     if (!view) return NO;
@@ -69,52 +48,22 @@ static BOOL LGViewBelongsToWidgetStack(UIView *view) {
     return NO;
 }
 
-static BOOL LGHasAncestorClassNamed(UIView *view, NSString *className) {
-    UIView *ancestor = view.superview;
-    while (ancestor) {
-        if ([NSStringFromClass([ancestor class]) isEqualToString:className]) return YES;
-        ancestor = ancestor.superview;
-    }
-    return NO;
-}
-
-static BOOL LGResponderChainContainsClassNamed(UIResponder *responder, NSString *className) {
-    UIResponder *current = responder;
-    while (current) {
-        if ([NSStringFromClass([current class]) isEqualToString:className]) return YES;
-        current = current.nextResponder;
-    }
-    return NO;
-}
-
 static void LGStartWidgetDisplayLink(void) {
-    if (sWidgetLink) return;
-    sWidgetTicker = [LGWidgetTicker new];
-    sWidgetLink = [CADisplayLink displayLinkWithTarget:sWidgetTicker selector:@selector(tick:)];
-    if ([sWidgetLink respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-        sWidgetLink.preferredFramesPerSecond = LGWidgetPreferredFPS();
-    [sWidgetLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    LGStartDisplayLink(&sWidgetLink, &sWidgetTicker, LGPreferredFramesPerSecondForKey(@"Homescreen.FPS", 30), ^{
+        LG_updateRegisteredGlassViews(LGUpdateGroupWidgets);
+    });
 }
 
 static void LGStopWidgetDisplayLink(void) {
-    [sWidgetLink invalidate];
-    sWidgetLink = nil;
-    sWidgetTicker = nil;
+    LGStopDisplayLink(&sWidgetLink, &sWidgetTicker);
 }
 
 static UIColor *widgetTintColorForView(UIView *view) {
-    if (@available(iOS 12.0, *)) {
-        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
-        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [UIColor colorWithWhite:0.0 alpha:LGWidgetDarkTintAlpha()];
-    }
-    return [UIColor colorWithWhite:1.0 alpha:LGWidgetLightTintAlpha()];
+    return LGDefaultTintColorForView(view, LGWidgetLightTintAlpha(), LGWidgetDarkTintAlpha());
 }
 
 static void removeWidgetOverlays(UIView *view) {
-    UIView *tint = objc_getAssociatedObject(view, kWidgetTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(view, kWidgetTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(view, kWidgetTintKey);
     LiquidGlassView *glass = objc_getAssociatedObject(view, kWidgetGlassKey);
     if (glass) [glass removeFromSuperview];
     objc_setAssociatedObject(view, kWidgetGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -150,21 +99,16 @@ static void LGRestoreWidgetOriginalState(UIView *view) {
 }
 
 static void ensureWidgetTintOverlay(UIView *view) {
-    UIView *tint = objc_getAssociatedObject(view, kWidgetTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:view.bounds];
-        tint.tag = kWidgetTintTag;
-        tint.userInteractionEnabled = NO;
-        tint.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
-        [view addSubview:tint];
-        objc_setAssociatedObject(view, kWidgetTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    tint.frame = view.bounds;
-    tint.backgroundColor = widgetTintColorForView(view);
-    tint.layer.cornerRadius = view.layer.cornerRadius;
-    if (@available(iOS 13.0, *))
-        tint.layer.cornerCurve = view.layer.cornerCurve;
+    UIView *tint = LGEnsureTintOverlayView(view,
+                                           kWidgetTintKey,
+                                           kWidgetTintTag,
+                                           view.bounds,
+                                           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
+    LGConfigureTintOverlayView(tint,
+                               widgetTintColorForView(view),
+                               view.layer.cornerRadius,
+                               view.layer,
+                               NO);
     [view bringSubviewToFront:tint];
 }
 
@@ -243,16 +187,10 @@ static void LGInjectIntoWidgetMaterialView(UIView *view) {
     });
 }
 
-static void LGWidgetsTraverseViews(UIView *root, void (^block)(UIView *view)) {
-    if (!root) return;
-    block(root);
-    for (UIView *sub in root.subviews) LGWidgetsTraverseViews(sub, block);
-}
-
 static void LGWidgetsRefreshAllHosts(void) {
     UIApplication *app = UIApplication.sharedApplication;
     void (^refreshWindow)(UIWindow *) = ^(UIWindow *window) {
-        LGWidgetsTraverseViews(window, ^(UIView *view) {
+        LGTraverseViews(window, ^(UIView *view) {
             if (!LGIsWidgetMaterialView(view)) return;
             LGPrepareWidgetMaterialView(view);
             LGInjectIntoWidgetMaterialView(view);
@@ -264,7 +202,7 @@ static void LGWidgetsRefreshAllHosts(void) {
             for (UIWindow *window in ((UIWindowScene *)scene).windows) refreshWindow(window);
         }
     } else {
-        for (UIWindow *window in [app valueForKey:@"windows"]) refreshWindow(window);
+        for (UIWindow *window in LGApplicationWindows(app)) refreshWindow(window);
     }
 }
 
@@ -277,6 +215,8 @@ static void LGWidgetsPrefsChanged(CFNotificationCenterRef center,
         LGWidgetsRefreshAllHosts();
     });
 }
+
+%group LGWidgetsSpringBoard
 
 %hook MTMaterialView
 
@@ -320,15 +260,6 @@ static void LGWidgetsPrefsChanged(CFNotificationCenterRef center,
 
 %end
 
-%ctor {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
-                                    LGWidgetsPrefsChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-}
-
 %hook UIScrollView
 
 - (void)setContentOffset:(CGPoint)offset {
@@ -344,3 +275,13 @@ static void LGWidgetsPrefsChanged(CFNotificationCenterRef center,
 }
 
 %end
+
+%end
+
+%ctor {
+    if (!LGIsSpringBoardProcess()) return;
+    LGObservePreferenceChanges(^{
+        LGWidgetsPrefsChanged(NULL, NULL, NULL, NULL, NULL);
+    });
+    %init(LGWidgetsSpringBoard);
+}

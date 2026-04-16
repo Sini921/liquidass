@@ -1,20 +1,15 @@
 #import "../LiquidAssPrefs/LGPrefsLiquidSlider.h"
 #import "../LiquidAssPrefs/LGPrefsLiquidSwitch.h"
+#import "../LiquidGlass.h"
 
 static __thread void *sLGCurrentSliderSpecifier = NULL;
-static NSString * const kLGPrefsDomain = @"dylv.liquidassprefs";
 
 static BOOL LGIsPreferencesApp(void) {
     return [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.Preferences"];
 }
 
 static BOOL LGSettingsControlsEnabled(void) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)@"SettingsControls.Enabled",
-                                                        (__bridge CFStringRef)kLGPrefsDomain);
-    if (!value) return NO;
-    BOOL enabled = CFGetTypeID(value) == CFBooleanGetTypeID() ? CFBooleanGetValue(value) : [(__bridge id)value boolValue];
-    CFRelease(value);
-    return enabled;
+    return LG_prefBool(@"SettingsControls.Enabled", NO);
 }
 
 static id LGCellSpecifier(id cell) {

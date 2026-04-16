@@ -1,8 +1,9 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
 static const NSInteger kDockTintTag       = 0xD0CC;
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 
 typedef NS_ENUM(NSInteger, LGDockMode) {
     LGDockModeNone = 0,
@@ -10,56 +11,25 @@ typedef NS_ENUM(NSInteger, LGDockMode) {
     LGDockModeFloating,
 };
 
-static void stopDockDisplayLink(void);
 static void LGDockRefreshAllHosts(void);
 
-@interface LGDockTicker : NSObject
-- (void)tick:(CADisplayLink *)dl;
-@end
-
-@implementation LGDockTicker
-- (void)tick:(CADisplayLink *)dl {
-    LG_updateRegisteredGlassViews(LGUpdateGroupDock);
-}
-@end
-
 static CADisplayLink *sDockLink = nil;
-static LGDockTicker *sDockTicker = nil;
+static id sDockTicker = nil;
 static NSInteger sDockCount = 0;
 
-static BOOL LGDockEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"Dock.Enabled", YES); }
-static CGFloat LGDockCornerRadiusHomeButton(void) { return LG_prefFloat(@"Dock.CornerRadiusHomeButton", 0.0); }
-static CGFloat LGDockCornerRadiusFullScreen(void) { return LG_prefFloat(@"Dock.CornerRadiusFullScreen", 34.0); }
-static CGFloat LGDockCornerRadiusFloating(void) { return LG_prefFloat(@"Dock.CornerRadiusFloating", 30.5); }
-static CGFloat LGDockBezelWidth(void) { return LG_prefFloat(@"Dock.BezelWidth", 30.0); }
-static CGFloat LGDockGlassThickness(void) { return LG_prefFloat(@"Dock.GlassThickness", 150.0); }
-static CGFloat LGDockRefractionScale(void) { return LG_prefFloat(@"Dock.RefractionScale", 1.5); }
-static CGFloat LGDockRefractiveIndex(void) { return LG_prefFloat(@"Dock.RefractiveIndex", 1.5); }
-static CGFloat LGDockSpecularOpacity(void) { return LG_prefFloat(@"Dock.SpecularOpacity", 0.5); }
-static CGFloat LGDockBlur(void) { return LG_prefFloat(@"Dock.Blur", 10.0); }
-static CGFloat LGDockWallpaperScale(void) { return LG_prefFloat(@"Dock.WallpaperScale", 0.25); }
-static CGFloat LGDockLightTintAlpha(void) { return LG_prefFloat(@"Dock.LightTintAlpha", 0.1); }
-static CGFloat LGDockDarkTintAlpha(void) { return LG_prefFloat(@"Dock.DarkTintAlpha", 0.0); }
-
-static NSInteger LGDockPreferredFPS(void) {
-    NSInteger maxFPS = UIScreen.mainScreen.maximumFramesPerSecond > 0
-        ? UIScreen.mainScreen.maximumFramesPerSecond
-        : 60;
-    NSInteger fps = LG_prefInteger(@"Homescreen.FPS", maxFPS >= 120 ? 120 : 60);
-    if (fps < 30) fps = 30;
-    if (fps > maxFPS) fps = maxFPS;
-    return fps;
-}
-
-static BOOL hasAncestorClass(UIView *view, Class cls) {
-    if (!cls) return NO;
-    UIView *v = view.superview;
-    while (v) {
-        if ([v isKindOfClass:cls]) return YES;
-        v = v.superview;
-    }
-    return NO;
-}
+LG_ENABLED_BOOL_PREF_FUNC(LGDockEnabled, "Dock.Enabled", YES)
+LG_FLOAT_PREF_FUNC(LGDockCornerRadiusHomeButton, "Dock.CornerRadiusHomeButton", 0.0)
+LG_FLOAT_PREF_FUNC(LGDockCornerRadiusFullScreen, "Dock.CornerRadiusFullScreen", 34.0)
+LG_FLOAT_PREF_FUNC(LGDockCornerRadiusFloating, "Dock.CornerRadiusFloating", 30.5)
+LG_FLOAT_PREF_FUNC(LGDockBezelWidth, "Dock.BezelWidth", 30.0)
+LG_FLOAT_PREF_FUNC(LGDockGlassThickness, "Dock.GlassThickness", 150.0)
+LG_FLOAT_PREF_FUNC(LGDockRefractionScale, "Dock.RefractionScale", 1.5)
+LG_FLOAT_PREF_FUNC(LGDockRefractiveIndex, "Dock.RefractiveIndex", 1.5)
+LG_FLOAT_PREF_FUNC(LGDockSpecularOpacity, "Dock.SpecularOpacity", 0.5)
+LG_FLOAT_PREF_FUNC(LGDockBlur, "Dock.Blur", 10.0)
+LG_FLOAT_PREF_FUNC(LGDockWallpaperScale, "Dock.WallpaperScale", 0.25)
+LG_FLOAT_PREF_FUNC(LGDockLightTintAlpha, "Dock.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGDockDarkTintAlpha, "Dock.DarkTintAlpha", 0.0)
 
 static BOOL isInsideCategoryStackBackground(UIView *view) {
     UIView *v = view;
@@ -87,7 +57,7 @@ static BOOL LGHasFloatingDockWindow(void) {
         return NO;
     }
 
-    for (UIWindow *window in [app valueForKey:@"windows"])
+    for (UIWindow *window in LGApplicationWindows(app))
         if ([window isKindOfClass:floatingWindowCls]) return YES;
     return NO;
 }
@@ -95,13 +65,13 @@ static BOOL LGHasFloatingDockWindow(void) {
 static BOOL isInsideRegularDock(UIView *view) {
     static Class cls;
     if (!cls) cls = NSClassFromString(@"SBDockView");
-    return hasAncestorClass(view, cls);
+    return LGHasAncestorClass(view, cls);
 }
 
 static BOOL isInsideFloatingDock(UIView *view) {
     static Class cls;
     if (!cls) cls = NSClassFromString(@"SBFloatingDockPlatterView");
-    return hasAncestorClass(view, cls);
+    return LGHasAncestorClass(view, cls);
 }
 
 static BOOL isReasonableDockMaterialBounds(CGRect bounds) {
@@ -113,6 +83,8 @@ static void *kDockAttachedKey = &kDockAttachedKey;
 static void *kDockModeKey = &kDockModeKey;
 static void *kDockTintKey = &kDockTintKey;
 static void *kDockGlassKey = &kDockGlassKey;
+static void *kDockOriginalFrameKey = &kDockOriginalFrameKey;
+static void *kDockOriginalSuperviewClipsKey = &kDockOriginalSuperviewClipsKey;
 
 static LGDockMode LGResolveDockModeForView(UIView *view) {
     if (isInsideCategoryStackBackground(view)) return LGDockModeNone;
@@ -127,55 +99,98 @@ static LGDockMode LGResolveDockModeForView(UIView *view) {
 }
 
 static void startDockDisplayLink(void) {
-    if (sDockLink) return;
-    sDockTicker = [LGDockTicker new];
-    sDockLink = [CADisplayLink displayLinkWithTarget:sDockTicker selector:@selector(tick:)];
-    if ([sDockLink respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-        sDockLink.preferredFramesPerSecond = LGDockPreferredFPS();
-    [sDockLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    LGStartDisplayLink(&sDockLink, &sDockTicker, LGPreferredFramesPerSecondForKey(@"Homescreen.FPS", 30), ^{
+        LG_updateRegisteredGlassViews(LGUpdateGroupDock);
+    });
 }
 
 static void stopDockDisplayLink(void) {
-    [sDockLink invalidate];
-    sDockLink = nil;
-    sDockTicker = nil;
+    LGStopDisplayLink(&sDockLink, &sDockTicker);
+}
+
+static BOOL LGDockNeedsLegacyPadding(LGDockMode mode) {
+    if (mode != LGDockModeRegular) return NO;
+    if (!LGIsAtLeastiOS16()) return NO;
+    return !LG_isFullScreenDevice();
+}
+
+static CGRect LGDockOverlayFrameForHost(UIView *host, LGDockMode mode) {
+    return host.bounds;
+}
+
+static void LGRestoreDockHostFrameIfNeeded(UIView *host) {
+    if (!host) return;
+    NSValue *originalFrameValue = objc_getAssociatedObject(host, kDockOriginalFrameKey);
+    if (originalFrameValue) {
+        host.frame = originalFrameValue.CGRectValue;
+        objc_setAssociatedObject(host, kDockOriginalFrameKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }
+
+    UIView *superview = host.superview;
+    NSNumber *originalSuperviewClips = objc_getAssociatedObject(host, kDockOriginalSuperviewClipsKey);
+    if (superview && originalSuperviewClips) {
+        superview.clipsToBounds = originalSuperviewClips.boolValue;
+        superview.layer.masksToBounds = superview.clipsToBounds;
+        objc_setAssociatedObject(host, kDockOriginalSuperviewClipsKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
+static void LGApplyDockHostPaddingIfNeeded(UIView *host, LGDockMode mode) {
+    if (!host) return;
+    if (!LGDockNeedsLegacyPadding(mode)) {
+        LGRestoreDockHostFrameIfNeeded(host);
+        return;
+    }
+
+    UIView *superview = host.superview;
+    if (!superview) return;
+
+    objc_setAssociatedObject(host, kDockOriginalFrameKey, [NSValue valueWithCGRect:host.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!objc_getAssociatedObject(host, kDockOriginalSuperviewClipsKey)) {
+        objc_setAssociatedObject(host, kDockOriginalSuperviewClipsKey, @(superview.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    static const CGFloat kLegacyDockHorizontalPadding = 8.0;
+    static const CGFloat kLegacyDockBottomPadding = 8.0;
+    CGRect frame = host.frame;
+    frame.origin.x -= kLegacyDockHorizontalPadding;
+    frame.size.width += (kLegacyDockHorizontalPadding * 2.0);
+    frame.size.height += kLegacyDockBottomPadding;
+    host.frame = frame;
+
+    superview.clipsToBounds = NO;
+    superview.layer.masksToBounds = NO;
 }
 
 static UIColor *dockTintColorForView(UIView *view) {
-    if (@available(iOS 12.0, *)) {
-        if (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [[UIColor blackColor] colorWithAlphaComponent:LGDockDarkTintAlpha()];
-    }
-    return [[UIColor whiteColor] colorWithAlphaComponent:LGDockLightTintAlpha()];
+    return LGDefaultTintColorForView(view, LGDockLightTintAlpha(), LGDockDarkTintAlpha());
 }
 
 static void ensureDockTintOverlay(UIView *host) {
     if (!host) return;
-    UIView *tint = objc_getAssociatedObject(host, kDockTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:host.bounds];
-        tint.userInteractionEnabled = NO;
-        tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        tint.tag = kDockTintTag;
-        objc_setAssociatedObject(host, kDockTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [host addSubview:tint];
-    }
-    tint.frame = host.bounds;
-    tint.layer.cornerRadius = host.layer.cornerRadius;
-    tint.layer.cornerCurve = host.layer.cornerCurve;
-    tint.backgroundColor = dockTintColorForView(host);
-    tint.hidden = (tint.backgroundColor == nil);
+    LGDockMode mode = (LGDockMode)[objc_getAssociatedObject(host, kDockModeKey) integerValue];
+    CGRect overlayFrame = LGDockOverlayFrameForHost(host, mode);
+    UIView *tint = LGEnsureTintOverlayView(host,
+                                           kDockTintKey,
+                                           kDockTintTag,
+                                           overlayFrame,
+                                           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
+    tint.frame = overlayFrame;
+    LGConfigureTintOverlayView(tint,
+                               dockTintColorForView(host),
+                               host.layer.cornerRadius,
+                               host.layer,
+                               NO);
     [host bringSubviewToFront:tint];
 }
 
 static void removeDockOverlays(UIView *host) {
     if (!host) return;
-    UIView *tint = objc_getAssociatedObject(host, kDockTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(host, kDockTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(host, kDockTintKey);
     LiquidGlassView *glass = objc_getAssociatedObject(host, kDockGlassKey);
     if (glass) [glass removeFromSuperview];
     objc_setAssociatedObject(host, kDockGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRestoreDockHostFrameIfNeeded(host);
 }
 
 static void injectIntoDock(UIView *self_) {
@@ -186,6 +201,7 @@ static void injectIntoDock(UIView *self_) {
     NSNumber *modeNumber = objc_getAssociatedObject(self_, kDockModeKey);
     LGDockMode mode = (LGDockMode)modeNumber.integerValue;
     if (mode == LGDockModeNone) return;
+    LGApplyDockHostPaddingIfNeeded(self_, mode);
 
     CGPoint wallpaperOrigin = CGPointZero;
     UIImage *wallpaper = LG_getHomescreenSnapshot(&wallpaperOrigin);
@@ -201,18 +217,24 @@ static void injectIntoDock(UIView *self_) {
     }
 
     LiquidGlassView *glass = objc_getAssociatedObject(self_, kDockGlassKey);
+    CGRect glassFrame = LGDockOverlayFrameForHost(self_, mode);
 
     if (!glass) {
         glass = [[LiquidGlassView alloc]
-            initWithFrame:self_.bounds wallpaper:wallpaper wallpaperOrigin:wallpaperOrigin];
+            initWithFrame:glassFrame wallpaper:wallpaper wallpaperOrigin:wallpaperOrigin];
         glass.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                                  UIViewAutoresizingFlexibleHeight;
         [self_ addSubview:glass];
         objc_setAssociatedObject(self_, kDockGlassKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         glass.wallpaperImage = wallpaper;
+        if (glass.superview != self_) {
+            [glass removeFromSuperview];
+            [self_ addSubview:glass];
+        }
     }
 
+    glass.frame = glassFrame;
     glass.cornerRadius    = (mode == LGDockModeFloating)
         ? LGDockCornerRadiusFloating()
         : (LG_isFullScreenDevice() ? LGDockCornerRadiusFullScreen() : LGDockCornerRadiusHomeButton());
@@ -229,19 +251,13 @@ static void injectIntoDock(UIView *self_) {
     objc_setAssociatedObject(self_, kDockRetryKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
-static void LGDockTraverseViews(UIView *root, void (^block)(UIView *view)) {
-    if (!root) return;
-    block(root);
-    for (UIView *sub in root.subviews) LGDockTraverseViews(sub, block);
-}
-
 static void LGDockRefreshAllHosts(void) {
     UIApplication *app = UIApplication.sharedApplication;
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in app.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                LGDockTraverseViews(window, ^(UIView *view) {
+                LGTraverseViews(window, ^(UIView *view) {
                     if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                     if (isInsideCategoryStackBackground(view)) {
                         removeDockOverlays(view);
@@ -256,8 +272,8 @@ static void LGDockRefreshAllHosts(void) {
             }
         }
     } else {
-        for (UIWindow *window in [app valueForKey:@"windows"]) {
-            LGDockTraverseViews(window, ^(UIView *view) {
+        for (UIWindow *window in LGApplicationWindows(app)) {
+            LGTraverseViews(window, ^(UIView *view) {
                 if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                 if (isInsideCategoryStackBackground(view)) {
                     removeDockOverlays(view);
@@ -282,6 +298,8 @@ static void LGDockPrefsChanged(CFNotificationCenterRef center,
         LGDockRefreshAllHosts();
     });
 }
+
+%group LGDockSpringBoard
 
 %hook MTMaterialView
 
@@ -372,11 +390,12 @@ static void LGDockPrefsChanged(CFNotificationCenterRef center,
 
 %end
 
+%end
+
 %ctor {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
-                                    LGDockPrefsChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+    if (!LGIsSpringBoardProcess()) return;
+    LGObservePreferenceChanges(^{
+        LGDockPrefsChanged(NULL, NULL, NULL, NULL, NULL);
+    });
+    %init(LGDockSpringBoard);
 }

@@ -1,8 +1,9 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
 static const NSInteger kFolderIconTintTag      = 0xF01D;
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 static NSUInteger sFolderSnapshotGeneration = 0;
 
 static BOOL isInsideFolderIcon(UIView *view) {
@@ -59,52 +60,40 @@ static void LGScheduleFolderSnapshotWarmupForScroll(UIScrollView *scrollView, NS
     });
 }
 
-static BOOL LGFolderIconEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"FolderIcon.Enabled", YES); }
+LG_ENABLED_BOOL_PREF_FUNC(LGFolderIconEnabled, "FolderIcon.Enabled", YES)
+LG_FLOAT_PREF_FUNC(LGFolderIconBezelWidth, "FolderIcon.BezelWidth", 12.0)
+LG_FLOAT_PREF_FUNC(LGFolderIconGlassThickness, "FolderIcon.GlassThickness", 90.0)
+LG_FLOAT_PREF_FUNC(LGFolderIconRefractionScale, "FolderIcon.RefractionScale", 2.0)
+LG_FLOAT_PREF_FUNC(LGFolderIconRefractiveIndex, "FolderIcon.RefractiveIndex", 2.0)
+LG_FLOAT_PREF_FUNC(LGFolderIconSpecularOpacity, "FolderIcon.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGFolderIconBlur, "FolderIcon.Blur", 3.0)
+LG_FLOAT_PREF_FUNC(LGFolderIconWallpaperScale, "FolderIcon.WallpaperScale", 0.5)
+LG_FLOAT_PREF_FUNC(LGFolderIconLightTintAlpha, "FolderIcon.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGFolderIconDarkTintAlpha, "FolderIcon.DarkTintAlpha", 0.0)
 static CGFloat LGFolderIconCornerRadius(CGFloat fallback) { return LG_prefFloat(@"FolderIcon.CornerRadius", fallback); }
-static CGFloat LGFolderIconBezelWidth(void) { return LG_prefFloat(@"FolderIcon.BezelWidth", 12.0); }
-static CGFloat LGFolderIconGlassThickness(void) { return LG_prefFloat(@"FolderIcon.GlassThickness", 90.0); }
-static CGFloat LGFolderIconRefractionScale(void) { return LG_prefFloat(@"FolderIcon.RefractionScale", 2.0); }
-static CGFloat LGFolderIconRefractiveIndex(void) { return LG_prefFloat(@"FolderIcon.RefractiveIndex", 2.0); }
-static CGFloat LGFolderIconSpecularOpacity(void) { return LG_prefFloat(@"FolderIcon.SpecularOpacity", 0.8); }
-static CGFloat LGFolderIconBlur(void) { return LG_prefFloat(@"FolderIcon.Blur", 3.0); }
-static CGFloat LGFolderIconWallpaperScale(void) { return LG_prefFloat(@"FolderIcon.WallpaperScale", 0.5); }
-static CGFloat LGFolderIconLightTintAlpha(void) { return LG_prefFloat(@"FolderIcon.LightTintAlpha", 0.1); }
-static CGFloat LGFolderIconDarkTintAlpha(void) { return LG_prefFloat(@"FolderIcon.DarkTintAlpha", 0.0); }
 
 static UIColor *folderIconTintColorForView(UIView *view) {
-    if (@available(iOS 12.0, *)) {
-        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
-        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [UIColor colorWithWhite:0.0 alpha:LGFolderIconDarkTintAlpha()];
-    }
-    return [UIColor colorWithWhite:1.0 alpha:LGFolderIconLightTintAlpha()];
+    return LGDefaultTintColorForView(view, LGFolderIconLightTintAlpha(), LGFolderIconDarkTintAlpha());
 }
 
 static void removeFolderIconOverlays(UIView *self_) {
-    UIView *tint = objc_getAssociatedObject(self_, kFolderIconTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(self_, kFolderIconTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(self_, kFolderIconTintKey);
     LiquidGlassView *glass = objc_getAssociatedObject(self_, kFolderIconGlassKey);
     if (glass) [glass removeFromSuperview];
     objc_setAssociatedObject(self_, kFolderIconGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
 static void ensureFolderIconTintOverlay(UIView *self_) {
-    UIView *tint = objc_getAssociatedObject(self_, kFolderIconTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:self_.bounds];
-        tint.tag = kFolderIconTintTag;
-        tint.userInteractionEnabled = NO;
-        tint.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
-        [self_ addSubview:tint];
-        objc_setAssociatedObject(self_, kFolderIconTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    tint.frame = self_.bounds;
-    tint.backgroundColor = folderIconTintColorForView(self_);
-    tint.layer.cornerRadius = LGFolderIconCornerRadius(self_.layer.cornerRadius);
-    if (@available(iOS 13.0, *))
-        tint.layer.cornerCurve = self_.layer.cornerCurve;
+    UIView *tint = LGEnsureTintOverlayView(self_,
+                                           kFolderIconTintKey,
+                                           kFolderIconTintTag,
+                                           self_.bounds,
+                                           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
+    LGConfigureTintOverlayView(tint,
+                               folderIconTintColorForView(self_),
+                               LGFolderIconCornerRadius(self_.layer.cornerRadius),
+                               self_.layer,
+                               NO);
     [self_ bringSubviewToFront:tint];
 }
 
@@ -161,16 +150,10 @@ static void injectIntoFolderIcon(UIView *self_) {
     objc_setAssociatedObject(self_, kFolderIconRetryKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
-static void LGFolderIconTraverseViews(UIView *root, void (^block)(UIView *view)) {
-    if (!root) return;
-    block(root);
-    for (UIView *sub in root.subviews) LGFolderIconTraverseViews(sub, block);
-}
-
 static void LGFolderIconRefreshAllHosts(void) {
     UIWindow *window = LG_getHomescreenWindow();
     if (!window) return;
-    LGFolderIconTraverseViews(window, ^(UIView *view) {
+    LGTraverseViews(window, ^(UIView *view) {
         if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
         if (!isInsideFolderIcon(view)) return;
         injectIntoFolderIcon(view);
@@ -207,6 +190,8 @@ static void LGFolderIconPrefsChanged(CFNotificationCenterRef center,
     });
 }
 
+%group LGFolderIconSpringBoard
+
 %hook MTMaterialView
 
 - (void)didMoveToWindow {
@@ -241,15 +226,6 @@ static void LGFolderIconPrefsChanged(CFNotificationCenterRef center,
 
 %end
 
-%ctor {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
-                                    LGFolderIconPrefsChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-}
-
 %hook SBIconScrollView
 
 - (void)setContentOffset:(CGPoint)offset {
@@ -263,3 +239,13 @@ static void LGFolderIconPrefsChanged(CFNotificationCenterRef center,
 }
 
 %end
+
+%end
+
+%ctor {
+    if (!LGIsSpringBoardProcess()) return;
+    LGObservePreferenceChanges(^{
+        LGFolderIconPrefsChanged(NULL, NULL, NULL, NULL, NULL);
+    });
+    %init(LGFolderIconSpringBoard);
+}

@@ -7,24 +7,40 @@ This tweak is incomplete, issues WILL happen.
 >
 > contributions to this tweak are welcomed.
 
-this tweak compared to that LiquidGlassKit based tweak is missing a lot of things including:
-- passcode buttons
-- control center
-- etc i havent even tried that tweak out yet
+## Applied to
+- folders on the homescreen
+- opened folders
+- widgets
+- underneath app icons
+- dock
+- lockscreen platter views (notifications & music player)
+- quick actions buttons
+- app library
+- settings app switches and sliders (experimental, causes crash with back-navigation)
+- clock (experimental)
 
 ## Quick explanation on how this tweak works
-- right now the tweak takes an image of certain screen views then feed it to a Metal renderer, then draw the masked glass effect on top on the views (`LiquidGlassView`)
-- for iOS 15 and lower it usually uses the cpbitmaps in /var/mobile/Library/SpringBoard/ for the wallpaper and sometimes fallback to snapshotting the static wallpaper view (SBFStatic... smth i forgot)
-- iOS 16 posterboard is pretty unstable
-- display link and origin updates keep the glass aligned with the moving UI BUT it usually does not regenerate the underlying source image every frame, mostly moves the sampling/origin math around the existing captured texture.
+- the tweak injects a `LiquidGlassView` into specific springboard surfaces, then feeds that view a backdrop source plus screenspace origin data
+- most surfaces are still snapshot / wallpaper based:
+  - homescreen, dock, folders, widgets, context menus, App Library, lockscreen platters, etc usually sample from cached wallpaper or cached composite snapshots
+  - on iOS 15 and lower it can still decode cpbitmap wallpapers directly
+- once a source image is captured, the tweak usually does not rebuild it every frame. the common path is:
+  - cache the source image
+  - upload it to Metal
+  - keep the glass aligned by updating origin / sampling coordinates on display link ticks
+  - except for the notification banners which uses a springboard-local live backdrop capture path
+- the code splits to these folders:
+  - `Runtime/` owns the Metal renderer
+  - `Shared/` owns prefs / logging / hook helpers
+  - `Hooks/` owns the per-surface injection logic
 
 ## The Metal shader
-- samples a blurred version of the source texture as the base body of the glass
-- computes how far each fragment is from the nearest edge of the glass shape
-- near the bezel, it applies stronger UV displacement using Snell's law (read https://en.wikipedia.org/wiki/Snell%27s_law) for the refraction
-- got specular highlight
-
-## so tf am i gonna do with this tweak now?
-as you read the quote above (from my reddit post), im researching a way to get true backdrop sampling instead of faking it with laggy ass snapshots. the current approach is too CPU-bound, data getting constantly moved between the CPU and GPU which sucks ass.
+- the renderer uploads the source image as a Metal texture, bakes a blurred variant, then draws the glass in a custom fragment shader
+- the normal rounded glass path uses the card bounds / corner radius to estimate edge distance, then uses that edge band to drive:
+  - Snell's [law of refraction](https://en.wikipedia.org/wiki/Snell%27s_law)
+  - blur/body mix
+  - specular highlight / fresnel-ish lift
+- there is also a shape mask path used for the experimental lockscreen clock. the shader receives a second texture mask and derives edge behavior from the glyph shape instead of only from a rounded rect
+- the blur is separable and baked in two compute passes, then reused until settings or source content actually require a rebake
 
 ### contributions to this tweak are welcome

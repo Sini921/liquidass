@@ -3,76 +3,10 @@
 #import <objc/runtime.h>
 #import <fcntl.h>
 #import <unistd.h>
-#import <CoreVideo/CoreVideo.h>
-#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
-#import "Shared/LGMetalShaderSource.h"
-
-#ifndef LG_DEBUG_VERBOSE
-#define LG_DEBUG_VERBOSE 0
-#endif
+#import "Runtime/LGLiquidGlassRuntime.h"
+#import "Runtime/LGSnapshotCaptureSupport.h"
 
 static BOOL LG_isAtLeastiOS16(void);
-
-static NSString *LGLogFilePath(void) {
-    static NSString *sPath = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sPath = @"/tmp/LiquidAss.log";
-    });
-    return sPath;
-}
-
-static void LGAppendLogLine(NSString *line) {
-    NSString *path = LGLogFilePath();
-    if (!path.length || !line.length) return;
-
-    static dispatch_queue_t sLogQueue;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sLogQueue = dispatch_queue_create("dylv.liquidass.logfile", DISPATCH_QUEUE_SERIAL);
-    });
-
-    dispatch_async(sLogQueue, ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!handle) return;
-        @try {
-            [handle seekToEndOfFile];
-            NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-            if (data.length) [handle writeData:data];
-        } @catch (__unused NSException *exception) {
-        }
-        @try {
-            [handle closeFile];
-        } @catch (__unused NSException *exception) {
-        }
-    });
-}
-
-void LGLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    NSLog(@"[LiquidAss] %@", message);
-    LGAppendLogLine([NSString stringWithFormat:@"[LiquidAss] %@\n", message]);
-}
-
-static inline void LGDebugLog(NSString *format, ...) {
-#if LG_DEBUG_VERBOSE
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    LGLog(@"%@", message);
-#else
-    (void)format;
-#endif
-}
 
 typedef NS_OPTIONS(NSUInteger, SBSRelaunchActionOptions) {
     SBSRelaunchActionOptionsNone = 0,
@@ -94,35 +28,28 @@ typedef NS_OPTIONS(NSUInteger, SBSRelaunchActionOptions) {
 - (BOOL)drawHierarchyInRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates;
 @end
 
+@interface PBUISnapshotReplicaView : UIView
+@end
 
-typedef struct {
-    vector_float2 resolution;
-    vector_float2 screenResolution;
-    vector_float2 cardOrigin;
-    vector_float2 wallpaperResolution;
-    float         radius;
-    float         bezelWidth;
-    float         glassThickness;
-    float         refractionScale;
-    float         refractiveIndex;
-    float         specularOpacity;
-    float         specularAngle;
-    float         blur;
-    vector_float2 wallpaperOrigin;
-    float         samplingOrientation;
-} LGUniforms;
+static const NSInteger kLGMaxViewTraversalDepth = 96;
 
-UIView *LG_findSubviewOfClass(UIView *root, Class cls) {
+static UIView *LG_findSubviewOfClassImpl(UIView *root, Class cls, NSInteger depth) {
+    if (!root || !cls || depth > kLGMaxViewTraversalDepth) return nil;
     if ([root isKindOfClass:cls]) return root;
     for (UIView *sub in root.subviews) {
-        UIView *r = LG_findSubviewOfClass(sub, cls);
-        if (r) return r;
+        UIView *found = LG_findSubviewOfClassImpl(sub, cls, depth + 1);
+        if (found) return found;
     }
     return nil;
 }
 
+
+UIView *LG_findSubviewOfClass(UIView *root, Class cls) {
+    return LG_findSubviewOfClassImpl(root, cls, 0);
+}
+
 static void LG_updateAllGlassViewsInTreeImpl(UIView *root, int depth) {
-    if (!root || depth > 64) return;
+    if (!root || depth > kLGMaxViewTraversalDepth) return;
     if (root.hidden || root.alpha <= 0.01f || root.layer.opacity <= 0.01f) return;
     static Class glassClass;
     if (!glassClass) glassClass = [LiquidGlassView class];
@@ -142,6 +69,7 @@ void LG_updateAllGlassViewsInTree(UIView *root) {
 static NSHashTable *sRegisteredGlassViews[LGUpdateGroupWidgets + 1] = { nil };
 
 void LG_registerGlassView(UIView *view, LGUpdateGroup group) {
+    LGAssertMainThread();
     if (!view) return;
     if (group <= LGUpdateGroupAll || group > LGUpdateGroupWidgets) return;
     if (!sRegisteredGlassViews[group])
@@ -150,6 +78,7 @@ void LG_registerGlassView(UIView *view, LGUpdateGroup group) {
 }
 
 void LG_unregisterGlassView(UIView *view, LGUpdateGroup group) {
+    LGAssertMainThread();
     if (group <= LGUpdateGroupAll || group > LGUpdateGroupWidgets) return;
     [sRegisteredGlassViews[group] removeObject:view];
 }
@@ -171,6 +100,7 @@ static void LG_updateGlassHashTable(NSHashTable *table) {
 }
 
 void LG_updateRegisteredGlassViews(LGUpdateGroup group) {
+    LGAssertMainThread();
     if (group == LGUpdateGroupAll) {
         for (NSInteger i = LGUpdateGroupDock; i <= LGUpdateGroupWidgets; i++)
             LG_updateGlassHashTable(sRegisteredGlassViews[i]);
@@ -205,10 +135,18 @@ BOOL LG_isFullScreenDevice(void) {
     static BOOL sCached = NO;
     static BOOL sResult = NO;
     if (!sCached) {
-        CGFloat h = UIScreen.mainScreen.bounds.size.height;
-        CGFloat w = UIScreen.mainScreen.bounds.size.width;
-        CGFloat longerSide = MAX(h, w);
-        sResult = (longerSide >= 812.0);
+        for (UIWindow *window in LGApplicationWindows(UIApplication.sharedApplication)) {
+            if (window.safeAreaInsets.top > 20.0) {
+                sResult = YES;
+                break;
+            }
+        }
+        if (!sResult) {
+            CGFloat h = UIScreen.mainScreen.bounds.size.height;
+            CGFloat w = UIScreen.mainScreen.bounds.size.width;
+            CGFloat longerSide = MAX(h, w);
+            sResult = (longerSide >= 812.0);
+        }
         sCached = YES;
     }
     return sResult;
@@ -241,7 +179,7 @@ static BOOL LG_viewMatchesHierarchyClass(UIView *view, Class cls) {
         if ([v isKindOfClass:cls]) return YES;
         v = v.superview;
     }
-    UIResponder *r = view;
+    UIResponder *r = view.nextResponder;
     while (r) {
         if ([r isKindOfClass:cls]) return YES;
         r = r.nextResponder;
@@ -261,7 +199,7 @@ static UIImageView *LG_findImageViewInTree(UIView *root) {
 }
 
 static void LG_collectViewsOfClass(UIView *root, Class cls, NSMutableArray<UIView *> *results, NSInteger depth) {
-    if (!root || !cls || !results || depth > 96) return;
+    if (!root || !cls || !results || depth > kLGMaxViewTraversalDepth) return;
     if ([root isKindOfClass:cls]) [results addObject:root];
     for (UIView *sub in root.subviews)
         LG_collectViewsOfClass(sub, cls, results, depth + 1);
@@ -358,26 +296,6 @@ static CGPoint LG_getHomescreenWallpaperOriginForImage(UIImage *image) {
     return LG_centeredWallpaperOriginForImage(image);
 }
 
-static float LG_samplingOrientationForGlassView(UIView *view, LGUpdateGroup group) {
-    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return 1.0f;
-    if (group == LGUpdateGroupLockscreen) return 1.0f;
-    if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = view.window.windowScene;
-        if (scene) return (float)scene.interfaceOrientation;
-    }
-    return 1.0f;
-}
-
-static UIImage *LG_normalizedImageForUpload(UIImage *image) {
-    if (!image) return nil;
-    if (image.imageOrientation == UIImageOrientationUp) return image;
-    UIGraphicsBeginImageContextWithOptions(image.size, NO, image.scale);
-    [image drawInRect:CGRectMake(0, 0, image.size.width, image.size.height)];
-    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return normalized ?: image;
-}
-
 static UIImage *sCachedSnapshot = nil;
 static UIImage *sCachedContextMenuSnapshot = nil;
 static UIImage *sCachedFolderSnapshot = nil;
@@ -397,18 +315,14 @@ static BOOL sLegacyWallpaperRescanScheduled = NO;
 static NSUInteger sPendingHomescreenWallpaperRefreshToken = 0;
 static NSUInteger sPendingLockscreenWallpaperRefreshToken = 0;
 static BOOL sSnapshotRetryScheduled = NO;
-static NSString * const kLGPrefsDomain = @"dylv.liquidassprefs";
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
-static CFStringRef const kLGPrefsRespringNotification = CFSTR("dylv.liquidassprefs/Respring");
 static void LG_trySnapshotWithRetry(void);
 static void LG_scheduleHomescreenWallpaperRefresh(NSString *reason, UIImage *image);
 static void LG_scheduleLockscreenWallpaperRefresh(NSString *reason);
 static void LG_handlePrefsChanged(void);
+static void LG_handleMemoryWarning(void);
 static void LG_requestRespring(void);
-static CGColorSpaceRef LGSharedRGBColorSpace(void);
 static void LG_startLegacyWallpaperWatcher(void);
 static void LGScheduleBlockAfterDelay(NSTimeInterval delay, dispatch_block_t block);
-static void LG_clearTextureCache(void);
 
 static BOOL LG_isAtLeastiOS16(void) {
     static BOOL sCachedResult = NO;
@@ -601,7 +515,7 @@ static UIImage *LG_decodeCPBitmapAtPath(NSString *path) {
         for (size_t x = 0; x < width; x++) {
             size_t srcOffset = (x * 4) + (y * lineSize * 4);
             size_t dstOffset = (x * 4) + (y * width * 4);
-            if (srcOffset + 3 >= length) return nil;
+            if (srcOffset + 3 >= payloadBytes) return nil;
             // cpbitmap stores BGRA; UIKit wants RGBA here.
             dst[dstOffset + 0] = bytes[srcOffset + 2];
             dst[dstOffset + 1] = bytes[srcOffset + 1];
@@ -689,35 +603,8 @@ static UIImage *LG_loadSpringBoardWallpaperImage(BOOL lockscreen) {
     return image;
 }
 
-BOOL LG_prefBool(NSString *key, BOOL fallback) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
-                                                        (__bridge CFStringRef)kLGPrefsDomain);
-    id obj = CFBridgingRelease(value);
-    if ([obj isKindOfClass:[NSNumber class]]) return [obj boolValue];
-    return fallback;
-}
-
-CGFloat LG_prefFloat(NSString *key, CGFloat fallback) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
-                                                        (__bridge CFStringRef)kLGPrefsDomain);
-    id obj = CFBridgingRelease(value);
-    if ([obj isKindOfClass:[NSNumber class]]) return (CGFloat)[obj doubleValue];
-    return fallback;
-}
-
-NSInteger LG_prefInteger(NSString *key, NSInteger fallback) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
-                                                        (__bridge CFStringRef)kLGPrefsDomain);
-    id obj = CFBridgingRelease(value);
-    if ([obj isKindOfClass:[NSNumber class]]) return [obj integerValue];
-    return fallback;
-}
-
-BOOL LG_globalEnabled(void) {
-    return LG_prefBool(@"Global.Enabled", NO);
-}
-
 UIImage *LG_getWallpaperImage(CGPoint *outOriginInScreenPts) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) {
         if (outOriginInScreenPts) *outOriginInScreenPts = CGPointZero;
         return nil;
@@ -744,15 +631,6 @@ UIImage *LG_getWallpaperImage(CGPoint *outOriginInScreenPts) {
 static UIImage *sInterceptedWallpaperImage = nil;
 static void *kLGSnapshotOriginalOpacityKey = &kLGSnapshotOriginalOpacityKey;
 
-static CGColorSpaceRef LGSharedRGBColorSpace(void) {
-    static CGColorSpaceRef sColorSpace = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sColorSpace = CGColorSpaceCreateDeviceRGB();
-    });
-    return sColorSpace;
-}
-
 BOOL LG_imageLooksBlack(UIImage *img) {
     if (!img) return YES;
     CGImageRef cg = img.CGImage;
@@ -769,78 +647,14 @@ BOOL LG_imageLooksBlack(UIImage *img) {
     return nonBlack < 3;
 }
 
-static NSInteger LG_defaultPreferredFPS(void) {
-    NSInteger maxFPS = 60;
-    if ([UIScreen mainScreen].maximumFramesPerSecond > 0) {
-        maxFPS = [UIScreen mainScreen].maximumFramesPerSecond >= 120 ? 120 : 60;
-    }
-    return (30 + maxFPS) / 2;
-}
-
-static NSInteger LG_preferredFPSForUpdateGroup(LGUpdateGroup group) {
-    NSInteger maxFPS = 60;
-    if ([UIScreen mainScreen].maximumFramesPerSecond > 0) {
-        maxFPS = [UIScreen mainScreen].maximumFramesPerSecond >= 120 ? 120 : 60;
-    }
-    NSString *key = nil;
-    switch (group) {
-        case LGUpdateGroupDock:
-        case LGUpdateGroupFolderIcon:
-        case LGUpdateGroupFolderOpen:
-        case LGUpdateGroupContextMenu:
-        case LGUpdateGroupWidgets:
-        case LGUpdateGroupAppIcons:
-            key = @"Homescreen.FPS";
-            break;
-        case LGUpdateGroupLockscreen:
-            key = @"Lockscreen.FPS";
-            break;
-        case LGUpdateGroupAppLibrary:
-            key = @"AppLibrary.FPS";
-            break;
-        default:
-            break;
-    }
-    NSInteger stored = LG_prefInteger(key ?: @"", LG_defaultPreferredFPS());
-    if (stored < 30) stored = 30;
-    if (stored > maxFPS) stored = maxFPS;
-    return stored;
-}
-
 static BOOL LG_contextSnapshotLooksIncomplete(UIImage *img) {
     if (!img) return YES;
     CGImageRef cg = img.CGImage;
     if (!cg) return YES;
-
-    const size_t sampleSize = 8;
-    unsigned char px[sampleSize * sampleSize * 4];
-    memset(px, 0, sizeof(px));
-    CGContextRef ctx = CGBitmapContextCreate(px, sampleSize, sampleSize, 8, sampleSize * 4,
-        LGSharedRGBColorSpace(), kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    if (!ctx) return YES;
-    CGContextDrawImage(ctx, CGRectMake(0, 0, sampleSize, sampleSize), cg);
-    CGContextRelease(ctx);
-
-    int brightCount = 0;
-    for (size_t i = 0; i < sampleSize * sampleSize; i++) {
-        if (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2] > 30)
-            brightCount++;
-    }
-    if (brightCount < 6) return YES;
-
-    const int cornerIndices[] = {
-        0,
-        (int)(sampleSize - 1),
-        (int)((sampleSize - 1) * sampleSize),
-        (int)(sampleSize * sampleSize - 1)
-    };
-    int blackCorners = 0;
-    for (int i = 0; i < 4; i++) {
-        int idx = cornerIndices[i];
-        int sum = px[idx * 4] + px[idx * 4 + 1] + px[idx * 4 + 2];
-        if (sum <= 36) blackCorners++;
-    }
-    return blackCorners >= 3;
+    if (img.scale <= 0.0) return YES;
+    if (img.size.width <= 0.0 || img.size.height <= 0.0) return YES;
+    if (CGImageGetWidth(cg) == 0 || CGImageGetHeight(cg) == 0) return YES;
+    return NO;
 }
 
 static void LG_drawWallpaperImageInContext(UIImage *image, CGPoint origin) {
@@ -869,8 +683,7 @@ static BOOL LG_drawHomescreenWallpaperInContext(CGSize screenSize) {
     if (!win) return NO;
     UIImageView *iv = LG_getWallpaperImageView(win, NO);
     if (iv.image) {
-        [win drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
-        return YES;
+        return LGDrawViewHierarchyIntoCurrentContext(win, bounds, NO);
     }
 
     static Class secureCls;
@@ -880,8 +693,7 @@ static BOOL LG_drawHomescreenWallpaperInContext(CGSize screenSize) {
         return YES;
     }
 
-    [win drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
-    return YES;
+    return LGDrawViewHierarchyIntoCurrentContext(win, bounds, NO);
 }
 
 static BOOL LG_drawLockscreenWallpaperInContext(CGSize screenSize) {
@@ -889,17 +701,21 @@ static BOOL LG_drawLockscreenWallpaperInContext(CGSize screenSize) {
     UIWindow *win = LG_getWallpaperWindow(YES);
     if (!win) return NO;
     UIImageView *iv = LG_getWallpaperImageView(win, YES);
-    if (LG_isAtLeastiOS16() && iv.image) {
-        CGRect displayedRect = LG_imageViewDisplayedImageRect(iv);
-        CGRect screenRect = [iv convertRect:displayedRect toView:nil];
-        [iv.image drawInRect:screenRect];
-        return YES;
+    if (LG_isAtLeastiOS16()) {
+        if (iv.image) {
+            CGRect displayedRect = LG_imageViewDisplayedImageRect(iv);
+            CGRect screenRect = [iv convertRect:displayedRect toView:nil];
+            [iv.image drawInRect:screenRect];
+            return YES;
+        }
+        BOOL drew = LGDrawViewHierarchyIntoCurrentContext(win, bounds, NO);
+        return drew;
     }
-    [win drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
-    return YES;
+    return LGDrawViewHierarchyIntoCurrentContext(win, bounds, NO);
 }
 
 void LG_refreshHomescreenSnapshot(void) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) {
         sCachedSnapshot = nil;
         return;
@@ -951,9 +767,52 @@ static void hideGlassViews(UIView *root, NSMutableArray *list) {
     for (UIView *sub in root.subviews) hideGlassViews(sub, list);
 }
 
+static BOOL LGWindowContainsContextMenuViews(UIWindow *window) {
+    if (!window) return NO;
+    static Class containerCls, listCls;
+    if (!containerCls) containerCls = NSClassFromString(@"_UIContextMenuContainerView");
+    if (!listCls) listCls = NSClassFromString(@"_UIContextMenuListView");
+    if ((containerCls && LG_findSubviewOfClass(window, containerCls)) ||
+        (listCls && LG_findSubviewOfClass(window, listCls))) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL LGWindowHasContextMenuController(UIWindow *window) {
+    if (!window) return NO;
+    static Class actionsOnlyVCCls, menuVCCls;
+    if (!actionsOnlyVCCls) actionsOnlyVCCls = NSClassFromString(@"_UIContextMenuActionsOnlyViewController");
+    if (!menuVCCls) menuVCCls = NSClassFromString(@"_UIContextMenuViewController");
+
+    UIViewController *root = window.rootViewController;
+    if (!root) return NO;
+    if ((actionsOnlyVCCls && [root isKindOfClass:actionsOnlyVCCls]) ||
+        (menuVCCls && [root isKindOfClass:menuVCCls])) {
+        return YES;
+    }
+
+    UIViewController *presented = root.presentedViewController;
+    while (presented) {
+        if ((actionsOnlyVCCls && [presented isKindOfClass:actionsOnlyVCCls]) ||
+            (menuVCCls && [presented isKindOfClass:menuVCCls])) {
+            return YES;
+        }
+        presented = presented.presentedViewController;
+    }
+    return NO;
+}
+
 static BOOL LG_isContextMenuWindow(UIWindow *window) {
-    return [NSStringFromClass(window.class) containsString:@"Context"] ||
-           [NSStringFromClass(window.class) containsString:@"Menu"];
+    if (!window) return NO;
+
+    static Class actionsWindowCls;
+    if (!actionsWindowCls) actionsWindowCls = NSClassFromString(@"_UIContextMenuActionsWindow");
+    if (actionsWindowCls && [window isKindOfClass:actionsWindowCls]) return YES;
+
+    if (LGWindowHasContextMenuController(window)) return YES;
+    if (LGWindowContainsContextMenuViews(window)) return YES;
+    return NO;
 }
 
 static BOOL LG_isWallpaperWindow(UIWindow *window) {
@@ -1026,7 +885,14 @@ static void LGResetHomescreenSnapshotCaches(void) {
     sCachedSpringBoardHomeImage = nil;
     sCachedSpringBoardHomeMTime = nil;
     sCachedSpringBoardHomePath = nil;
-    LG_clearTextureCache();
+    LGClearGlassTextureCache();
+}
+
+static void LGResetLockscreenSnapshotCaches(void) {
+    sCachedSpringBoardLockImage = nil;
+    sCachedSpringBoardLockMTime = nil;
+    sCachedSpringBoardLockPath = nil;
+    LGInvalidateLockscreenSnapshotCache();
 }
 
 static void LGScheduleBlockAfterDelay(NSTimeInterval delay, dispatch_block_t block) {
@@ -1065,7 +931,7 @@ static BOOL LG_isTodayViewControllerVisible(void) {
         return NO;
     }
 
-    for (UIWindow *window in [app valueForKey:@"windows"]) {
+    for (UIWindow *window in LGApplicationWindows(app)) {
         if (window.hidden || window.alpha <= 0.01f) continue;
         UIViewController *root = window.rootViewController;
         if (!root) continue;
@@ -1092,25 +958,23 @@ static UIView *LG_contextSnapshotTargetView(UIWindow *homescreenWindow) {
 static UIImage *LG_captureTargetViewSnapshot(UIView *targetView, CGSize screenSize, CGFloat scale) {
     if (!targetView || !targetView.window) return nil;
 
-    UIGraphicsBeginImageContextWithOptions(screenSize, NO, scale);
     CGRect targetRect = [targetView.window convertRect:targetView.bounds fromView:targetView];
-    BOOL ok = [targetView drawViewHierarchyInRect:targetRect afterScreenUpdates:YES];
-    UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-
-    if (!ok || LG_imageLooksBlack(snapshot)) return nil;
+    UIImage *snapshot = LGCaptureViewHierarchySnapshot(targetView, targetRect, screenSize, scale, NO);
+    if ((!snapshot || LG_imageLooksBlack(snapshot)) && targetView.window) {
+        snapshot = LGCaptureViewHierarchySnapshot(targetView, targetRect, screenSize, scale, YES);
+    }
+    if (!snapshot || LG_imageLooksBlack(snapshot)) return nil;
     return snapshot;
 }
 
 static UIImage *LG_captureWindowSnapshot(UIWindow *window, CGSize screenSize, CGFloat scale) {
     if (!window) return nil;
 
-    UIGraphicsBeginImageContextWithOptions(screenSize, NO, scale);
-    BOOL ok = [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
-    UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-
-    if (!ok || LG_imageLooksBlack(snapshot)) return nil;
+    UIImage *snapshot = LGCaptureViewHierarchySnapshot(window, window.bounds, screenSize, scale, NO);
+    if ((!snapshot || LG_imageLooksBlack(snapshot)) && window) {
+        snapshot = LGCaptureViewHierarchySnapshot(window, window.bounds, screenSize, scale, YES);
+    }
+    if (!snapshot || LG_imageLooksBlack(snapshot)) return nil;
     return snapshot;
 }
 
@@ -1226,6 +1090,7 @@ static UIImage *LG_captureContextMenuSnapshotWithHiddenGlass(BOOL hideGlass) {
 }
 
 void LG_cacheContextMenuSnapshot(void) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) return;
     if (sCachedContextMenuSnapshot) return;
     // hold a menu-safe snapshot only while the menu is coming in
@@ -1236,6 +1101,7 @@ void LG_cacheContextMenuSnapshot(void) {
 }
 
 void LG_invalidateContextMenuSnapshot(void) {
+    LGAssertMainThread();
     sCachedContextMenuSnapshot = nil;
 }
 
@@ -1251,11 +1117,13 @@ UIImage *LG_getStrictCachedContextMenuSnapshot(void) {
 }
 
 UIImage *LG_getContextMenuSnapshot(void) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) return nil;
     return LG_captureContextMenuSnapshotWithHiddenGlass(YES);
 }
 
 UIImage *LG_getHomescreenSnapshot(CGPoint *outOriginInScreenPts) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) {
         if (outOriginInScreenPts) *outOriginInScreenPts = CGPointZero;
         return nil;
@@ -1273,6 +1141,7 @@ UIImage *LG_getHomescreenSnapshot(CGPoint *outOriginInScreenPts) {
 }
 
 void LG_cacheFolderSnapshot(void) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) return;
     CFTimeInterval start = CACurrentMediaTime();
     LGDebugLog(@"folder snapshot cache begin");
@@ -1286,6 +1155,7 @@ void LG_cacheFolderSnapshot(void) {
 }
 
 void LG_invalidateFolderSnapshot(void) {
+    LGAssertMainThread();
     LGDebugLog(@"folder snapshot invalidated");
     sCachedFolderSnapshot = nil;
     LG_invalidateContextMenuSnapshot();
@@ -1314,10 +1184,30 @@ UIImage *LG_getLockscreenSnapshot(void) {
     CGFloat scale     = UIScreen.mainScreen.scale;
 
     UIGraphicsBeginImageContextWithOptions(screenSize, YES, scale);
-    LG_drawLockscreenWallpaperInContext(screenSize);
+    BOOL ok = LG_drawLockscreenWallpaperInContext(screenSize);
     UIImage *snap = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
+    LGLog(@"lockscreen snapshot result ok=%d size=%@ scale=%.2f",
+          ok ? 1 : 0,
+          snap ? NSStringFromCGSize(snap.size) : @"(null)",
+          snap ? snap.scale : 0.0);
     return snap;
+}
+
+UIImage *LG_getRawLockscreenWallpaperImage(void) {
+    if (!LG_globalEnabled()) return nil;
+
+    if (!LG_isAtLeastiOS16()) {
+        UIImage *asset = LG_loadSpringBoardWallpaperImage(YES);
+        if (asset) return asset;
+    }
+
+    UIWindow *win = LG_getWallpaperWindow(YES);
+    UIImageView *iv = win ? LG_getWallpaperImageView(win, YES) : nil;
+    if (iv.image)
+        return iv.image;
+
+    return nil;
 }
 
 CGPoint LG_getLockscreenWallpaperOrigin(void) {
@@ -1338,750 +1228,6 @@ CGPoint LG_getLockscreenWallpaperOrigin(void) {
     }
     return CGPointZero;
 }
-
-
-static id<MTLDevice>               sDevice;
-static id<MTLRenderPipelineState>  sPipeline;
-static id<MTLComputePipelineState> sBlurHPipeline;
-static id<MTLComputePipelineState> sBlurVPipeline;
-static id<MTLCommandQueue>         sSharedCommandQueue;
-static MTLComputePassDescriptor   *sComputePassDesc;
-
-@interface LGTextureCache : NSObject
-@property (nonatomic, strong) id<MTLTexture> bgTexture;
-@property (nonatomic, strong) id bridge;
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *blurVariants;
-@end
-@implementation LGTextureCache @end
-
-@interface LGBlurVariant : NSObject
-@property (nonatomic, strong) id<MTLTexture> texture;
-@property (nonatomic, assign) float bakedBlurRadius;
-@end
-@implementation LGBlurVariant @end
-
-@interface LGZeroCopyBridge : NSObject
-@property (nonatomic, strong) id<MTLDevice> device;
-@property (nonatomic, assign) CVMetalTextureCacheRef textureCache;
-@property (nonatomic, assign) CVPixelBufferRef pixelBuffer;
-@property (nonatomic, assign) CVMetalTextureRef cvTexture;
-- (instancetype)initWithDevice:(id<MTLDevice>)device;
-- (BOOL)setupBufferWithWidth:(size_t)width height:(size_t)height;
-- (id<MTLTexture>)renderWithActions:(void (^)(CGContextRef context))actions;
-@end
-
-@implementation LGZeroCopyBridge
-
-- (instancetype)initWithDevice:(id<MTLDevice>)device {
-    self = [super init];
-    if (!self) return nil;
-    _device = device;
-    CVMetalTextureCacheRef cache = NULL;
-    CVReturn status = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache);
-    if (status == kCVReturnSuccess) {
-        _textureCache = cache;
-    }
-    return self;
-}
-
-- (void)dealloc {
-    if (_cvTexture) {
-        CFRelease(_cvTexture);
-        _cvTexture = NULL;
-    }
-    if (_pixelBuffer) {
-        CVPixelBufferRelease(_pixelBuffer);
-        _pixelBuffer = NULL;
-    }
-    if (_textureCache) {
-        CFRelease(_textureCache);
-        _textureCache = NULL;
-    }
-}
-
-- (BOOL)setupBufferWithWidth:(size_t)width height:(size_t)height {
-    if (!_textureCache || !width || !height) return NO;
-
-    if (_cvTexture) {
-        CFRelease(_cvTexture);
-        _cvTexture = NULL;
-    }
-    if (_pixelBuffer) {
-        CVPixelBufferRelease(_pixelBuffer);
-        _pixelBuffer = NULL;
-    }
-
-    NSDictionary *attrs = @{
-        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
-        (__bridge NSString *)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (__bridge NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
-
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
-                                          width,
-                                          height,
-                                          kCVPixelFormatType_32BGRA,
-                                          (__bridge CFDictionaryRef)attrs,
-                                          &_pixelBuffer);
-    if (status != kCVReturnSuccess || !_pixelBuffer) return NO;
-
-    CVMetalTextureRef cvTexture = NULL;
-    status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
-                                                       _textureCache,
-                                                       _pixelBuffer,
-                                                       nil,
-                                                       MTLPixelFormatBGRA8Unorm,
-                                                       width,
-                                                       height,
-                                                       0,
-                                                       &cvTexture);
-    if (status != kCVReturnSuccess || !cvTexture) return NO;
-    _cvTexture = cvTexture;
-    return YES;
-}
-
-- (id<MTLTexture>)renderWithActions:(void (^)(CGContextRef context))actions {
-    if (!_pixelBuffer || !_textureCache || !_cvTexture) return nil;
-
-    CVPixelBufferLockBaseAddress(_pixelBuffer, 0);
-    void *data = CVPixelBufferGetBaseAddress(_pixelBuffer);
-    size_t width = CVPixelBufferGetWidth(_pixelBuffer);
-    size_t height = CVPixelBufferGetHeight(_pixelBuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(_pixelBuffer);
-
-    CGContextRef context = CGBitmapContextCreate(data,
-                                                 width,
-                                                 height,
-                                                 8,
-                                                 bytesPerRow,
-                                                 LGSharedRGBColorSpace(),
-                                                 kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-    if (!context) {
-        CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
-        return nil;
-    }
-
-    if (actions) actions(context);
-
-    CGContextRelease(context);
-    CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
-    CVMetalTextureCacheFlush(_textureCache, 0);
-    return CVMetalTextureGetTexture(_cvTexture);
-}
-
-@end
-
-static NSMapTable *sTextureCache = nil;
-
-static void LG_clearTextureCache(void) {
-    sTextureCache = [NSMapTable weakToStrongObjectsMapTable];
-}
-
-static NSNumber *LGTextureScaleKey(CGFloat scale) {
-    NSInteger milli = (NSInteger)lrint(scale * 1000.0);
-    return @(MAX(milli, 1));
-}
-
-static NSNumber *LGBlurSettingKey(CGFloat blur) {
-    NSInteger milli = (NSInteger)lrint(fmax(0.0, blur) * 1000.0);
-    return @(MAX(milli, 0));
-}
-
-static LGTextureCache *LG_getCacheForImage(UIImage *image, CGFloat scale) {
-    NSDictionary *variants = [sTextureCache objectForKey:image];
-    return variants[LGTextureScaleKey(scale)];
-}
-
-static void LG_setCacheForImage(UIImage *image, CGFloat scale, LGTextureCache *cache) {
-    NSMutableDictionary *variants = [sTextureCache objectForKey:image];
-    if (!variants) {
-        variants = [NSMutableDictionary dictionary];
-        [sTextureCache setObject:variants forKey:image];
-    }
-    variants[LGTextureScaleKey(scale)] = cache;
-}
-
-static void LG_prewarmPipelines(void) {
-    sDevice = MTLCreateSystemDefaultDevice();
-    if (!sDevice) { return; }
-
-    NSError *err = nil;
-    id<MTLLibrary> lib = [sDevice newLibraryWithSource:LGGlassMetalSource()
-                                               options:[MTLCompileOptions new]
-                                                 error:&err];
-    if (!lib) { return; }
-
-    id<MTLFunction> vert = [lib newFunctionWithName:@"vertexShader"];
-    id<MTLFunction> frag = [lib newFunctionWithName:@"fragmentShader"];
-
-    MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
-    desc.vertexFunction   = vert;
-    desc.fragmentFunction = frag;
-    MTLRenderPipelineColorAttachmentDescriptor *ca = desc.colorAttachments[0];
-    ca.pixelFormat                 = MTLPixelFormatBGRA8Unorm;
-    ca.blendingEnabled             = YES;
-    ca.rgbBlendOperation           = MTLBlendOperationAdd;
-    ca.alphaBlendOperation         = MTLBlendOperationAdd;
-    ca.sourceRGBBlendFactor        = MTLBlendFactorSourceAlpha;
-    ca.destinationRGBBlendFactor   = MTLBlendFactorOneMinusSourceAlpha;
-    ca.sourceAlphaBlendFactor      = MTLBlendFactorOne;
-    ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    sPipeline = [sDevice newRenderPipelineStateWithDescriptor:desc error:&err];
-
-    id<MTLFunction> blurH = [lib newFunctionWithName:@"blurH"];
-    id<MTLFunction> blurV = [lib newFunctionWithName:@"blurV"];
-    sBlurHPipeline = [sDevice newComputePipelineStateWithFunction:blurH error:&err];
-    sBlurVPipeline = [sDevice newComputePipelineStateWithFunction:blurV error:&err];
-    sSharedCommandQueue = [sDevice newCommandQueue];
-    sComputePassDesc    = [MTLComputePassDescriptor computePassDescriptor];
-    LG_clearTextureCache();
-}
-
-
-@implementation LiquidGlassView {
-    id<MTLTexture> _bgTexture;
-    id<MTLTexture> _blurredTexture;
-    LGTextureCache *_cacheEntry;
-    MTKView        *_mtkView;
-    BOOL             _needsBlurBake;
-    float            _lastBakedBlurRadius;
-    CGPoint          _wallpaperOriginPt;
-    CGSize           _sourceWallpaperPixelSize;
-    CGRect           _cachedVisualRectPx;
-    CGSize           _cachedDrawableSizePx;
-    float            _cachedVisualScale;
-    BOOL             _hasCachedVisualMetrics;
-    BOOL             _drawScheduled;
-    CGFloat          _effectiveTextureScale;
-    CGSize           _lastLayoutBounds;
-    CFTimeInterval   _lastDrawSubmissionTime;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame wallpaper:(UIImage *)wallpaper wallpaperOrigin:(CGPoint)origin {
-    self = [super initWithFrame:frame];
-    if (!self) return nil;
-
-    _cornerRadius        = 13.5;
-    _bezelWidth          = 14;
-    _glassThickness      = 80;
-    _refractionScale     = 1.2;
-    _refractiveIndex     = 1.0;
-    _specularOpacity     = 0.8;
-    _blur                = 8;
-    _wallpaperScale      = 1.0;
-    _updateGroup         = LGUpdateGroupAll;
-    _wallpaperOriginPt   = origin;
-    _needsBlurBake       = YES;
-    _lastBakedBlurRadius = -1;
-    _effectiveTextureScale = -1;
-    _lastLayoutBounds = CGSizeZero;
-    _lastDrawSubmissionTime = 0;
-
-    if (!sDevice) { return nil; }
-
-    _mtkView = [[MTKView alloc] initWithFrame:self.bounds device:sDevice];
-    _mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _mtkView.clearColor       = MTLClearColorMake(0, 0, 0, 0);
-    _mtkView.framebufferOnly  = NO;
-    _mtkView.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
-    _mtkView.paused           = YES;
-    _mtkView.enableSetNeedsDisplay = NO;
-    _mtkView.opaque           = NO;
-    _mtkView.layer.opaque = NO;
-    _mtkView.delegate     = self;
-    [self addSubview:_mtkView];
-
-    self.clipsToBounds      = YES;
-    self.layer.cornerRadius = _cornerRadius;
-    if (@available(iOS 13.0, *))
-        self.layer.cornerCurve = kCACornerCurveContinuous;
-
-    _wallpaperImage = wallpaper;
-    return self;
-}
-- (void)setReleasesWallpaperAfterUpload:(BOOL)releases {
-    _releasesWallpaperAfterUpload = releases;
-    if (releases && (_bgTexture || _cacheEntry))
-        _wallpaperImage = nil;
-}
-
-- (void)setCornerRadius:(CGFloat)r {
-    if (fabs(_cornerRadius - r) < 0.001f) return;
-    _cornerRadius = r;
-    self.layer.cornerRadius = r;
-    [self scheduleDraw];
-}
-
-- (void)setBlur:(CGFloat)b {
-    if (fabs(_blur - b) < 0.001f) return;
-    _blur = b;
-    _needsBlurBake = YES;
-    [self scheduleDraw];
-}
-
-- (void)setBezelWidth:(CGFloat)value {
-    if (fabs(_bezelWidth - value) < 0.001f) return;
-    _bezelWidth = value;
-    [self scheduleDraw];
-}
-
-- (void)setGlassThickness:(CGFloat)value {
-    if (fabs(_glassThickness - value) < 0.001f) return;
-    _glassThickness = value;
-    [self scheduleDraw];
-}
-
-- (void)setRefractionScale:(CGFloat)value {
-    if (fabs(_refractionScale - value) < 0.001f) return;
-    _refractionScale = value;
-    [self scheduleDraw];
-}
-
-- (void)setRefractiveIndex:(CGFloat)value {
-    if (fabs(_refractiveIndex - value) < 0.001f) return;
-    _refractiveIndex = value;
-    [self scheduleDraw];
-}
-
-- (void)setSpecularOpacity:(CGFloat)value {
-    if (fabs(_specularOpacity - value) < 0.001f) return;
-    _specularOpacity = value;
-    [self scheduleDraw];
-}
-
-- (void)setWallpaperImage:(UIImage *)img {
-    if (_wallpaperImage == img) return;
-    _wallpaperImage = img;
-    [self _reloadTexture];
-    [self scheduleDraw];
-}
-
-- (CGPoint)wallpaperOrigin {
-    return _wallpaperOriginPt;
-}
-
-- (void)setWallpaperOrigin:(CGPoint)origin {
-    if (fabs(_wallpaperOriginPt.x - origin.x) < 0.001f &&
-        fabs(_wallpaperOriginPt.y - origin.y) < 0.001f) {
-        return;
-    }
-    _wallpaperOriginPt = origin;
-    [self scheduleDraw];
-}
-
-- (void)setWallpaperScale:(CGFloat)scale {
-    CGFloat clamped = fmax(0.1, fmin(scale, 1.0));
-    if (fabs(_wallpaperScale - clamped) < 0.001f) return;
-    CGFloat previousEffectiveScale = _effectiveTextureScale;
-    _wallpaperScale = clamped;
-    _effectiveTextureScale = -1;
-    if (self.wallpaperImage) {
-        NSUInteger srcW = (NSUInteger)(self.wallpaperImage.size.width  * self.wallpaperImage.scale);
-        NSUInteger srcH = (NSUInteger)(self.wallpaperImage.size.height * self.wallpaperImage.scale);
-        CGFloat nextEffectiveScale = [self _recommendedInternalTextureScaleForSourceWidth:srcW height:srcH];
-        if (fabs(previousEffectiveScale - nextEffectiveScale) > 0.001f || !_bgTexture) {
-            [self _reloadTexture];
-        }
-    } else {
-        [self _reloadTexture];
-    }
-    [self scheduleDraw];
-}
-
-- (void)setUpdateGroup:(LGUpdateGroup)group {
-    if (_updateGroup == group) return;
-    if (_updateGroup != LGUpdateGroupAll)
-        LG_unregisterGlassView(self, _updateGroup);
-    _updateGroup = group;
-    if (_updateGroup != LGUpdateGroupAll)
-        LG_registerGlassView(self, _updateGroup);
-}
-
-- (void)updateOrigin {
-    if (!_mtkView.superview) return;
-    if (!_bgTexture && self.wallpaperImage) [self _reloadTexture];
-    if (self.hidden || self.alpha <= 0.01f || self.layer.opacity <= 0.01f) return;
-    BOOL metricsChanged = [self _refreshVisualMetrics];
-    CGFloat scale = UIScreen.mainScreen.scale;
-    CGRect screenBoundsPx = CGRectMake(0, 0,
-                                       UIScreen.mainScreen.bounds.size.width * scale,
-                                       UIScreen.mainScreen.bounds.size.height * scale);
-    if (!CGRectIntersectsRect(_cachedVisualRectPx, screenBoundsPx)) return;
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && metricsChanged) {
-        LGDebugLog(@"glass update group=%ld bounds=%@ visualPx=%@ screen=%@ origin=%@ wallpaper=%@",
-                   (long)_updateGroup,
-                   NSStringFromCGRect(self.bounds),
-                   NSStringFromCGRect(_cachedVisualRectPx),
-                   NSStringFromCGSize(UIScreen.mainScreen.bounds.size),
-                   NSStringFromCGPoint(_wallpaperOriginPt),
-                   self.wallpaperImage ? NSStringFromCGSize(self.wallpaperImage.size) : @"(null)");
-    }
-    if (!metricsChanged && !_needsBlurBake) return;
-    [self scheduleDraw];
-}
-
-- (void)scheduleDraw {
-    if (!_mtkView.superview) return;
-    if (_drawScheduled) return;
-    _drawScheduled = YES;
-    CFTimeInterval now = CACurrentMediaTime();
-    NSInteger preferredFPS = MAX(30, LG_preferredFPSForUpdateGroup(_updateGroup));
-    CFTimeInterval earliest = _lastDrawSubmissionTime + (1.0 / (CFTimeInterval)preferredFPS);
-    CFTimeInterval delay = MAX(0.0, earliest - now);
-    __weak typeof(self) weakSelf = self;
-    dispatch_block_t block = ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-        self->_drawScheduled = NO;
-        if (!self->_mtkView.superview) return;
-        if (self.hidden || self.alpha <= 0.01f || self.layer.opacity <= 0.01f) return;
-        self->_lastDrawSubmissionTime = CACurrentMediaTime();
-        [self->_mtkView draw];
-    };
-    if (delay > 0.0) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), block);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), block);
-    }
-}
-
-- (BOOL)_refreshVisualMetrics {
-    CGFloat scale = UIScreen.mainScreen.scale;
-    CGRect visualRect;
-    BOOL useDirectScreenConversion = (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
-                                      _updateGroup != LGUpdateGroupLockscreen &&
-                                      self.window != nil);
-    if (useDirectScreenConversion) {
-        CGRect screenRect = self.window.windowScene
-            ? [self convertRect:self.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
-            : [self convertRect:self.bounds toView:nil];
-        visualRect = CGRectMake(screenRect.origin.x * scale,
-                                screenRect.origin.y * scale,
-                                screenRect.size.width * scale,
-                                screenRect.size.height * scale);
-    } else if (self.window) {
-        CALayer *pres = self.layer.presentationLayer ?: self.layer;
-        CALayer *windowLayer = self.window.layer.presentationLayer ?: self.window.layer;
-        CGRect windowScreenRect = self.window.windowScene
-            ? [self.window convertRect:self.window.bounds
-                     toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
-            : [self.window convertRect:self.window.bounds toView:nil];
-        if (pres != windowLayer) {
-            CGRect vr = pres.bounds;
-            CALayer *cur = pres;
-            while (cur && cur != windowLayer) {
-                CALayer *up = cur.superlayer;
-                if (!up) break;
-                CALayer *upPres = up.presentationLayer ?: up;
-                vr = [cur convertRect:vr toLayer:upPres];
-                cur = upPres;
-            }
-            visualRect = CGRectMake((windowScreenRect.origin.x + vr.origin.x) * scale,
-                                    (windowScreenRect.origin.y + vr.origin.y) * scale,
-                                    vr.size.width * scale,
-                                    vr.size.height * scale);
-        } else {
-            CGRect screenRect = self.window.windowScene
-                ? [self convertRect:self.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
-                : [self convertRect:self.bounds toView:nil];
-            visualRect = CGRectMake(screenRect.origin.x * scale,
-                                    screenRect.origin.y * scale,
-                                    screenRect.size.width * scale,
-                                    screenRect.size.height * scale);
-        }
-    } else {
-        CALayer *pres = self.layer.presentationLayer ?: self.layer;
-        CALayer *root = pres;
-        while (root.superlayer)
-            root = root.superlayer.presentationLayer ?: root.superlayer;
-
-        if (root != pres) {
-            CGRect vr = pres.bounds;
-            CALayer *cur = pres;
-            while (cur && cur != root) {
-                CALayer *up = cur.superlayer;
-                if (!up) break;
-                CALayer *upPres = up.presentationLayer ?: up;
-                vr = [cur convertRect:vr toLayer:upPres];
-                cur = upPres;
-            }
-            visualRect = CGRectMake(vr.origin.x * scale,
-                                    vr.origin.y * scale,
-                                    vr.size.width * scale,
-                                    vr.size.height * scale);
-        } else {
-            CGPoint orig = [self convertPoint:CGPointZero toView:nil];
-            visualRect = CGRectMake(orig.x * scale,
-                                    orig.y * scale,
-                                    self.bounds.size.width * scale,
-                                    self.bounds.size.height * scale);
-        }
-    }
-
-    CGSize drawableSize = _mtkView.drawableSize;
-    float drawableW = self.bounds.size.width * scale;
-    float visualScale = (drawableW > 0.0f) ? (CGRectGetWidth(visualRect) / drawableW) : 1.0f;
-
-    if (_hasCachedVisualMetrics
-        && fabs(CGRectGetMinX(_cachedVisualRectPx) - CGRectGetMinX(visualRect)) < 0.5f
-        && fabs(CGRectGetMinY(_cachedVisualRectPx) - CGRectGetMinY(visualRect)) < 0.5f
-        && fabs(CGRectGetWidth(_cachedVisualRectPx) - CGRectGetWidth(visualRect)) < 0.5f
-        && fabs(CGRectGetHeight(_cachedVisualRectPx) - CGRectGetHeight(visualRect)) < 0.5f
-        && fabs(_cachedDrawableSizePx.width - drawableSize.width) < 0.5f
-        && fabs(_cachedDrawableSizePx.height - drawableSize.height) < 0.5f
-        && fabs(_cachedVisualScale - visualScale) < 0.001f) {
-        return NO;
-    }
-
-    _cachedVisualRectPx = visualRect;
-    _cachedDrawableSizePx = drawableSize;
-    _cachedVisualScale = visualScale;
-    _hasCachedVisualMetrics = YES;
-    return YES;
-}
-
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    CGFloat scale = UIScreen.mainScreen.scale;
-    CGSize boundsSize = self.bounds.size;
-    CGSize drawableSize = CGSizeMake(MAX(1.0, floor(boundsSize.width * scale)),
-                                     MAX(1.0, floor(boundsSize.height * scale)));
-    if (!CGSizeEqualToSize(_mtkView.drawableSize, drawableSize)) {
-        _mtkView.drawableSize = drawableSize;
-        _hasCachedVisualMetrics = NO;
-    }
-    if (!CGSizeEqualToSize(_lastLayoutBounds, boundsSize)) {
-        _lastLayoutBounds = boundsSize;
-        [self scheduleDraw];
-    }
-}
-
-- (CGFloat)_recommendedInternalTextureScaleForSourceWidth:(NSUInteger)srcW height:(NSUInteger)srcH {
-    CGFloat userScale = fmax(0.1, fmin(_wallpaperScale, 1.0));
-    CGFloat screenScale = UIScreen.mainScreen.scale;
-    CGFloat viewMaxPx = MAX(self.bounds.size.width, self.bounds.size.height) * screenScale;
-    CGFloat sourceMaxPx = MAX((CGFloat)srcW, (CGFloat)srcH);
-    if (viewMaxPx <= 1.0 || sourceMaxPx <= 1.0) return userScale;
-
-    // Small surfaces do not benefit from full-size wallpaper textures.
-    CGFloat adaptiveScale = (viewMaxPx * 2.4) / sourceMaxPx;
-    adaptiveScale = fmax(0.16, fmin(adaptiveScale, 1.0));
-    CGFloat groupCap = 1.0;
-    switch (_updateGroup) {
-        case LGUpdateGroupAppIcons: groupCap = 0.28; break;
-        case LGUpdateGroupFolderIcon: groupCap = 0.28; break;
-        case LGUpdateGroupWidgets: groupCap = 0.34; break;
-        case LGUpdateGroupAppLibrary: groupCap = 0.30; break;
-        case LGUpdateGroupDock: groupCap = 0.42; break;
-        case LGUpdateGroupContextMenu: groupCap = 0.42; break;
-        case LGUpdateGroupFolderOpen: groupCap = 0.42; break;
-        case LGUpdateGroupLockscreen: groupCap = 0.65; break;
-        default: break;
-    }
-    return fmin(fmin(userScale, adaptiveScale), groupCap);
-}
-
-- (void)_reloadTexture {
-    UIImage *image = LG_normalizedImageForUpload(self.wallpaperImage);
-    if (!image) return;
-    NSUInteger srcW = (NSUInteger)(image.size.width  * image.scale);
-    NSUInteger srcH = (NSUInteger)(image.size.height * image.scale);
-    CGFloat textureScale = [self _recommendedInternalTextureScaleForSourceWidth:srcW height:srcH];
-    _effectiveTextureScale = textureScale;
-    // keep the real wallpaper size for uv math even if the texture is downscaled
-    _sourceWallpaperPixelSize = CGSizeMake(srcW, srcH);
-    NSUInteger w = MAX((NSUInteger)1, (NSUInteger)lrint(srcW * textureScale));
-    NSUInteger h = MAX((NSUInteger)1, (NSUInteger)lrint(srcH * textureScale));
-    if (!w || !h) return;
-
-    LGTextureCache *cached = LG_getCacheForImage(image, textureScale);
-    if (cached) {
-        _cacheEntry = cached;
-        _bgTexture = cached.bgTexture;
-        LGBlurVariant *variant = cached.blurVariants[LGBlurSettingKey(_blur)];
-        _blurredTexture = variant.texture;
-        if (variant.texture) {
-            _needsBlurBake       = NO;
-            _lastBakedBlurRadius = variant.bakedBlurRadius;
-        } else {
-            _needsBlurBake       = YES;
-            _lastBakedBlurRadius = -1;
-        }
-        if (_releasesWallpaperAfterUpload)
-            _wallpaperImage = nil;
-        return;
-    }
-
-    LGZeroCopyBridge *bridge = [[LGZeroCopyBridge alloc] initWithDevice:sDevice];
-    if (![bridge setupBufferWithWidth:w height:h]) return;
-
-    _bgTexture = [bridge renderWithActions:^(CGContextRef ctx) {
-        CGContextClearRect(ctx, CGRectMake(0, 0, w, h));
-        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image.CGImage);
-    }];
-    if (!_bgTexture) return;
-
-    MTLTextureDescriptor *rd =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                          width:w height:h mipmapped:NO];
-    rd.usage        = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    _blurredTexture = nil;
-
-    LGTextureCache *entry   = [LGTextureCache new];
-    entry.bgTexture         = _bgTexture;
-    entry.bridge            = bridge;
-    entry.blurVariants      = [NSMutableDictionary dictionary];
-    _cacheEntry             = entry;
-    LG_setCacheForImage(image, textureScale, entry);
-
-    _needsBlurBake       = YES;
-    _lastBakedBlurRadius = -1;
-    if (_releasesWallpaperAfterUpload)
-        _wallpaperImage = nil;
-}
-
-- (void)_runBlurPassesWithRadius:(float)radius commandBuffer:(id<MTLCommandBuffer>)cmdBuf {
-    if (!_bgTexture || !_blurredTexture) return;
-
-    if (radius < 0.5f) {
-        id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        if (!blit) return;
-        [blit copyFromTexture:_bgTexture
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(_bgTexture.width, _bgTexture.height, 1)
-                    toTexture:_blurredTexture
-             destinationSlice:0
-             destinationLevel:0
-            destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        return;
-    }
-
-    float sigma = MAX(radius * 0.5f, 0.1f);
-    MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:sDevice sigma:sigma];
-    blur.edgeMode = MPSImageEdgeModeClamp;
-    [blur encodeToCommandBuffer:cmdBuf sourceTexture:_bgTexture destinationTexture:_blurredTexture];
-}
-
-- (void)_ensureBlurTexture {
-    if (_blurredTexture || !_bgTexture) return;
-    MTLTextureDescriptor *rd =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                          width:_bgTexture.width
-                                                         height:_bgTexture.height
-                                                      mipmapped:NO];
-    rd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    _blurredTexture = [sDevice newTextureWithDescriptor:rd];
-}
-
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
-    _hasCachedVisualMetrics = NO;
-}
-
-- (void)drawInMTKView:(MTKView *)view {
-    if (!_bgTexture && self.wallpaperImage) [self _reloadTexture];
-    if (_bgTexture && !_blurredTexture) [self _ensureBlurTexture];
-    if (!sPipeline || !_bgTexture || !_blurredTexture) return;
-    [self _refreshVisualMetrics];
-    CGSize drawableSize = _cachedDrawableSizePx;
-    if (drawableSize.width < 1 || drawableSize.height < 1) return;
-    id<CAMetalDrawable>     drawable = view.currentDrawable;
-    MTLRenderPassDescriptor *passDesc = view.currentRenderPassDescriptor;
-    if (!drawable || !passDesc) return;
-    id<MTLCommandBuffer> cmdBuf = [sSharedCommandQueue commandBuffer];
-    if (!cmdBuf) return;
-
-    CGFloat scale = UIScreen.mainScreen.scale;
-    CGFloat screenW = UIScreen.mainScreen.bounds.size.width  * scale;
-    CGFloat screenH = UIScreen.mainScreen.bounds.size.height * scale;
-
-    float visOriginX = CGRectGetMinX(_cachedVisualRectPx);
-    float visOriginY = CGRectGetMinY(_cachedVisualRectPx);
-    float visW = CGRectGetWidth(_cachedVisualRectPx);
-    float visH = CGRectGetHeight(_cachedVisualRectPx);
-    float visualScale = _cachedVisualScale;
-    float samplingOrientation = LG_samplingOrientationForGlassView(self, _updateGroup);
-
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        LGDebugLog(@"glass draw group=%ld screenPx={%.1f %.1f} visualPx=%@ drawable=%@ wallpaperPx=%@ wallpaperOrigin=%@",
-                   (long)_updateGroup,
-                   screenW, screenH,
-                   NSStringFromCGRect(_cachedVisualRectPx),
-                   NSStringFromCGSize(drawableSize),
-                   NSStringFromCGSize(_sourceWallpaperPixelSize),
-                   NSStringFromCGPoint(_wallpaperOriginPt));
-    }
-
-    float imgW      = (float)_bgTexture.width;
-    float imgH      = (float)_bgTexture.height;
-    float fillScale = fmaxf((float)screenW / imgW, (float)screenH / imgH);
-    // smaller textures need less blur work
-    float blurPx    = (float)_blur * (float)scale / fillScale;
-
-    if ((_needsBlurBake || blurPx != _lastBakedBlurRadius) && _cacheEntry) {
-        LGBlurVariant *variant = _cacheEntry.blurVariants[LGBlurSettingKey(_blur)];
-        if (variant.texture) {
-            _blurredTexture = variant.texture;
-            _lastBakedBlurRadius = variant.bakedBlurRadius;
-            _needsBlurBake = NO;
-        }
-    }
-
-    if (_needsBlurBake || blurPx != _lastBakedBlurRadius) {
-        [self _ensureBlurTexture];
-        [self _runBlurPassesWithRadius:blurPx commandBuffer:cmdBuf];
-        _lastBakedBlurRadius = blurPx;
-        _needsBlurBake       = NO;
-        LGTextureCache *entry = _cacheEntry;
-        if (entry) {
-            LGBlurVariant *variant = [LGBlurVariant new];
-            variant.texture = _blurredTexture;
-            variant.bakedBlurRadius = blurPx;
-            entry.blurVariants[LGBlurSettingKey(_blur)] = variant;
-        }
-    }
-
-    id<MTLRenderCommandEncoder> enc =
-        [cmdBuf renderCommandEncoderWithDescriptor:passDesc];
-    LGUniforms u = {
-        .resolution       = { visW,   visH   },
-        .screenResolution = { (float)screenW,  (float)screenH  },
-        .cardOrigin       = { visOriginX, visOriginY },
-        .wallpaperResolution = { (float)_sourceWallpaperPixelSize.width,
-                                 (float)_sourceWallpaperPixelSize.height },
-        .radius           = (float)(_cornerRadius * scale * visualScale),
-        .bezelWidth       = (float)(_bezelWidth   * scale * visualScale),
-        .glassThickness   = (float)_glassThickness,
-        .refractionScale  = (float)_refractionScale,
-        .refractiveIndex  = (float)_refractiveIndex,
-        .specularOpacity  = (float)_specularOpacity,
-        .specularAngle    = 2.2689280f,
-        .blur             = blurPx,
-        .wallpaperOrigin  = { (float)(_wallpaperOriginPt.x * scale),
-                              (float)(_wallpaperOriginPt.y * scale) },
-        .samplingOrientation = samplingOrientation,
-    };
-    [enc setRenderPipelineState:sPipeline];
-    [enc setVertexBytes:&u   length:sizeof(u) atIndex:0];
-    [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
-    [enc setFragmentTexture:_blurredTexture atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-    [enc endEncoding];
-    [cmdBuf presentDrawable:drawable];
-    [cmdBuf commit];
-}
-
-- (void)dealloc {
-    if (_updateGroup != LGUpdateGroupAll)
-        LG_unregisterGlassView(self, _updateGroup);
-}
-
-@end
 
 static void LG_preferencesChanged(CFNotificationCenterRef center,
                                   void *observer,
@@ -2127,23 +1273,29 @@ static void LG_requestRespring(void) {
 }
 
 %ctor {
-    LGLog(@"loaded into %@", NSBundle.mainBundle.bundleIdentifier ?: @"(unknown)");
+    if (!LGIsSpringBoardProcess()) return;
+
+    LGReloadPreferences();
+    LGLog(@"loaded into %@", LGMainBundleIdentifier() ?: @"(unknown)");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        LG_prewarmPipelines();
+        LGPrewarmPipelines();
     });
     dispatch_async(dispatch_get_main_queue(), ^{
         LG_startLegacyWallpaperWatcher();
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            LG_handleMemoryWarning();
+        }];
+    });
+    LGObservePreferenceChanges(^{
+        LG_preferencesChanged(NULL, NULL, NULL, NULL, NULL);
     });
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
-                                    LG_preferencesChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
                                     LG_respringRequested,
-                                    kLGPrefsRespringNotification,
+                                    LGPrefsRespringNotification,
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 }
@@ -2230,10 +1382,7 @@ static void LG_scheduleHomescreenWallpaperRefresh(NSString *reason, UIImage *ima
 
 static void LG_scheduleLockscreenWallpaperRefresh(NSString *reason) {
     if (!LG_globalEnabled()) return;
-    sCachedSpringBoardLockImage = nil;
-    sCachedSpringBoardLockMTime = nil;
-    sCachedSpringBoardLockPath = nil;
-    LGInvalidateLockscreenSnapshotCache();
+    LGResetLockscreenSnapshotCaches();
     NSUInteger token = ++sPendingLockscreenWallpaperRefreshToken;
     LGDebugLog(@"lockscreen wallpaper refresh scheduled reason=%@", reason ?: @"(unknown)");
     LGScheduleBlockAfterDelay(0.30, ^{
@@ -2246,18 +1395,12 @@ static void LG_scheduleLockscreenWallpaperRefresh(NSString *reason) {
 }
 
 static void LG_handlePrefsChanged(void) {
+    LGAssertMainThread();
+    LGReloadPreferences();
     LGLog(@"preferences changed");
-    sCachedSnapshot = nil;
-    sCachedFolderSnapshot = nil;
-    sCachedContextMenuSnapshot = nil;
+    LGResetHomescreenSnapshotCaches();
     sInterceptedWallpaperImage = nil;
-    sCachedSpringBoardHomeImage = nil;
-    sCachedSpringBoardLockImage = nil;
-    sCachedSpringBoardHomeMTime = nil;
-    sCachedSpringBoardLockMTime = nil;
-    sCachedSpringBoardHomePath = nil;
-    sCachedSpringBoardLockPath = nil;
-    LGInvalidateLockscreenSnapshotCache();
+    LGResetLockscreenSnapshotCaches();
 
     if (!LG_globalEnabled()) return;
 
@@ -2275,7 +1418,16 @@ static void LG_handlePrefsChanged(void) {
     LG_updateRegisteredGlassViews(LGUpdateGroupAppLibrary);
 }
 
+static void LG_handleMemoryWarning(void) {
+    LGAssertMainThread();
+    LGLog(@"memory warning clearing caches");
+    LGResetHomescreenSnapshotCaches();
+    LGResetLockscreenSnapshotCaches();
+    sInterceptedWallpaperImage = nil;
+}
+
 static void LG_trySnapshotWithRetry(void) {
+    LGAssertMainThread();
     if (!LG_globalEnabled()) return;
     if (sCachedSnapshot) return;
     if (sSnapshotRetryScheduled) return;
@@ -2291,31 +1443,54 @@ static void LG_trySnapshotWithRetry(void) {
     });
 }
 
-%hook UIImageView
+static void *kLGReplicaObservedImageKey = &kLGReplicaObservedImageKey;
 
-- (void)setImage:(UIImage *)image {
-    %orig;
-    if (!LG_globalEnabled()) return;
+static void LGHandleWallpaperReplicaView(UIView *replicaView) {
+    if (!LG_globalEnabled() || !replicaView.window) return;
+    UIImageView *imageView = LG_findImageViewInTree(replicaView);
+    UIImage *image = imageView.image;
     if (!image) return;
     CGSize screen = UIScreen.mainScreen.bounds.size;
     if (image.size.width < screen.width * 0.5) return;
+
     static Class replicaCls, homePosterVCCls, lockPosterVCCls;
     if (!replicaCls) replicaCls = NSClassFromString(@"PBUISnapshotReplicaView");
     if (!homePosterVCCls) homePosterVCCls = NSClassFromString(@"PBUIPosterHomeViewController");
     if (!lockPosterVCCls) lockPosterVCCls = NSClassFromString(@"PBUIPosterLockViewController");
-    if (LG_viewMatchesHierarchyClass(self, replicaCls) &&
-        LG_viewMatchesHierarchyClass(self, homePosterVCCls)) {
+    if (!LG_viewMatchesHierarchyClass(replicaView, replicaCls)) return;
+
+    UIImage *lastImage = objc_getAssociatedObject(replicaView, kLGReplicaObservedImageKey);
+    if (LG_viewMatchesHierarchyClass(replicaView, homePosterVCCls)) {
         BOOL sameImage = (sInterceptedWallpaperImage == image);
-        if (!sameImage || !sCachedSnapshot) {
+        if (lastImage != image || !sameImage || !sCachedSnapshot) {
             LG_scheduleHomescreenWallpaperRefresh(@"poster-home-image", image);
         }
+        objc_setAssociatedObject(replicaView, kLGReplicaObservedImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    if (LG_viewMatchesHierarchyClass(self, replicaCls) &&
-        LG_viewMatchesHierarchyClass(self, lockPosterVCCls)) {
-        LG_scheduleLockscreenWallpaperRefresh(@"poster-lock-image");
+    if (LG_viewMatchesHierarchyClass(replicaView, lockPosterVCCls)) {
+        if (lastImage != image || !sCachedSpringBoardLockImage) {
+            LG_scheduleLockscreenWallpaperRefresh(@"poster-lock-image");
+        }
+        objc_setAssociatedObject(replicaView, kLGReplicaObservedImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
+}
+
+%hook PBUISnapshotReplicaView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (!((UIView *)self).window) {
+        objc_setAssociatedObject(self, kLGReplicaObservedImageKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        return;
+    }
+    LGHandleWallpaperReplicaView((UIView *)self);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    LGHandleWallpaperReplicaView((UIView *)self);
 }
 
 %end

@@ -5,5 +5,6 @@
 - (void)openHomescreen;
 - (void)openLockscreen;
 - (void)openAppLibrary;
+- (void)openMoreOptions;
 
 @end

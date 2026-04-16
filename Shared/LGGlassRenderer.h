@@ -1,11 +1,10 @@
 #pragma once
 
-#import <UIKit/UIKit.h>
-#import <MetalKit/MetalKit.h>
+#import "../LiquidGlass.h"
 
 void LGEnsureSharedGlassPipelinesReady(void);
 
-@interface LGSharedGlassView : UIView <MTKViewDelegate>
+@interface LGSharedGlassView : LiquidGlassView
 
 @property (nonatomic, strong) UIImage *sourceImage;
 @property (nonatomic, assign) CGPoint sourceOrigin;
@@ -20,7 +19,5 @@ void LGEnsureSharedGlassPipelinesReady(void);
 @property (nonatomic, assign) BOOL releasesSourceAfterUpload;
 
 - (instancetype)initWithFrame:(CGRect)frame sourceImage:(UIImage *)image sourceOrigin:(CGPoint)origin;
-- (void)updateOrigin;
-- (void)scheduleDraw;
 
 @end

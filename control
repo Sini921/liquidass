@@ -1,6 +1,6 @@
 Package: dylv.liquidass
 Name: liquidass
-Version: 6.alpha
+Version: 7.alpha
 Architecture: iphoneos-arm
 Description: ass
 Maintainer: dylv

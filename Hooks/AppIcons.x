@@ -1,4 +1,6 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
 static const NSInteger kAppIconTintTag = 0xA110;
@@ -10,17 +12,17 @@ static void *kAppIconOriginalTransformKey = &kAppIconOriginalTransformKey;
 static void *kAppIconLastGlassFrameKey = &kAppIconLastGlassFrameKey;
 static const CGFloat kAppIconImageScale = 0.99;
 
-static BOOL LGAppIconsEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"AppIcons.Enabled", NO); }
-static CGFloat LGAppIconCornerRadius(void) { return LG_prefFloat(@"AppIcons.CornerRadius", 13.5); }
-static CGFloat LGAppIconBezelWidth(void) { return LG_prefFloat(@"AppIcons.BezelWidth", 14.0); }
-static CGFloat LGAppIconGlassThickness(void) { return LG_prefFloat(@"AppIcons.GlassThickness", 80.0); }
-static CGFloat LGAppIconRefractionScale(void) { return LG_prefFloat(@"AppIcons.RefractionScale", 1.2); }
-static CGFloat LGAppIconRefractiveIndex(void) { return LG_prefFloat(@"AppIcons.RefractiveIndex", 1.0); }
-static CGFloat LGAppIconSpecularOpacity(void) { return LG_prefFloat(@"AppIcons.SpecularOpacity", 0.8); }
-static CGFloat LGAppIconBlur(void) { return LG_prefFloat(@"AppIcons.Blur", 8.0); }
-static CGFloat LGAppIconWallpaperScale(void) { return LG_prefFloat(@"AppIcons.WallpaperScale", 0.5); }
-static CGFloat LGAppIconLightTintAlpha(void) { return LG_prefFloat(@"AppIcons.LightTintAlpha", 0.1); }
-static CGFloat LGAppIconDarkTintAlpha(void) { return LG_prefFloat(@"AppIcons.DarkTintAlpha", 0.0); }
+LG_ENABLED_BOOL_PREF_FUNC(LGAppIconsEnabled, "AppIcons.Enabled", NO)
+LG_FLOAT_PREF_FUNC(LGAppIconCornerRadius, "AppIcons.CornerRadius", 13.5)
+LG_FLOAT_PREF_FUNC(LGAppIconBezelWidth, "AppIcons.BezelWidth", 14.0)
+LG_FLOAT_PREF_FUNC(LGAppIconGlassThickness, "AppIcons.GlassThickness", 80.0)
+LG_FLOAT_PREF_FUNC(LGAppIconRefractionScale, "AppIcons.RefractionScale", 1.2)
+LG_FLOAT_PREF_FUNC(LGAppIconRefractiveIndex, "AppIcons.RefractiveIndex", 1.0)
+LG_FLOAT_PREF_FUNC(LGAppIconSpecularOpacity, "AppIcons.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGAppIconBlur, "AppIcons.Blur", 8.0)
+LG_FLOAT_PREF_FUNC(LGAppIconWallpaperScale, "AppIcons.WallpaperScale", 0.5)
+LG_FLOAT_PREF_FUNC(LGAppIconLightTintAlpha, "AppIcons.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGAppIconDarkTintAlpha, "AppIcons.DarkTintAlpha", 0.0)
 
 static BOOL LGIsHomescreenIconImageView(UIView *view) {
     if (!view.window) return NO;
@@ -45,19 +47,12 @@ static CGRect LGAppIconGlassFrameInHost(UIView *iconView, UIView *host) {
 }
 
 static UIColor *appIconTintColorForView(UIView *view) {
-    if (@available(iOS 12.0, *)) {
-        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
-        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [UIColor colorWithWhite:0.0 alpha:LGAppIconDarkTintAlpha()];
-    }
-    return [UIColor colorWithWhite:1.0 alpha:LGAppIconLightTintAlpha()];
+    return LGDefaultTintColorForView(view, LGAppIconLightTintAlpha(), LGAppIconDarkTintAlpha());
 }
 
 static void removeAppIconOverlays(UIView *view) {
     UIView *host = LGAppIconHostView(view);
-    UIView *tint = objc_getAssociatedObject(host, kAppIconTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(host, kAppIconTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(host, kAppIconTintKey);
 
     LiquidGlassView *glass = objc_getAssociatedObject(host, kAppIconGlassKey);
     if (glass) [glass removeFromSuperview];
@@ -74,19 +69,19 @@ static void removeAppIconOverlays(UIView *view) {
 static void ensureAppIconTintOverlay(UIView *view) {
     UIView *host = LGAppIconHostView(view);
     CGRect frame = LGAppIconGlassFrameInHost(view, host);
-    UIView *tint = objc_getAssociatedObject(host, kAppIconTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:frame];
-        tint.tag = kAppIconTintTag;
-        tint.userInteractionEnabled = NO;
-        [host insertSubview:tint atIndex:0];
-        objc_setAssociatedObject(host, kAppIconTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    tint.frame = frame;
-    tint.backgroundColor = appIconTintColorForView(view);
-    tint.layer.cornerRadius = LGAppIconCornerRadius();
-    if (@available(iOS 13.0, *))
+    UIView *tint = LGEnsureTintOverlayView(host,
+                                           kAppIconTintKey,
+                                           kAppIconTintTag,
+                                           frame,
+                                           UIViewAutoresizingNone);
+    LGConfigureTintOverlayView(tint,
+                               appIconTintColorForView(view),
+                               LGAppIconCornerRadius(),
+                               nil,
+                               NO);
+    if (@available(iOS 13.0, *)) {
         tint.layer.cornerCurve = kCACornerCurveContinuous;
+    }
     [host insertSubview:tint aboveSubview:objc_getAssociatedObject(host, kAppIconGlassKey)];
 }
 

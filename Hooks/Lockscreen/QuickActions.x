@@ -1,15 +1,16 @@
 #import "Common.h"
+#import "../../Shared/LGPrefAccessors.h"
 
 static BOOL LGLockscreenQuickActionsEnabled(void) { return LGLockscreenEnabled() && LG_prefBool(@"LockscreenQuickActions.Enabled", YES); }
-static CGFloat LGLockscreenQuickActionsBezelWidth(void) { return LG_prefFloat(@"LockscreenQuickActions.BezelWidth", 12.0); }
-static CGFloat LGLockscreenQuickActionsGlassThickness(void) { return LG_prefFloat(@"LockscreenQuickActions.GlassThickness", 80.0); }
-static CGFloat LGLockscreenQuickActionsRefractionScale(void) { return LG_prefFloat(@"LockscreenQuickActions.RefractionScale", 1.2); }
-static CGFloat LGLockscreenQuickActionsRefractiveIndex(void) { return LG_prefFloat(@"LockscreenQuickActions.RefractiveIndex", 1.0); }
-static CGFloat LGLockscreenQuickActionsSpecularOpacity(void) { return LG_prefFloat(@"LockscreenQuickActions.SpecularOpacity", 0.8); }
-static CGFloat LGLockscreenQuickActionsBlur(void) { return LG_prefFloat(@"LockscreenQuickActions.Blur", 8.0); }
-static CGFloat LGLockscreenQuickActionsWallpaperScale(void) { return LG_prefFloat(@"LockscreenQuickActions.WallpaperScale", 0.5); }
-static CGFloat LGLockscreenQuickActionsLightTintAlpha(void) { return LG_prefFloat(@"LockscreenQuickActions.LightTintAlpha", 0.1); }
-static CGFloat LGLockscreenQuickActionsDarkTintAlpha(void) { return LG_prefFloat(@"LockscreenQuickActions.DarkTintAlpha", 0.0); }
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsBezelWidth, "LockscreenQuickActions.BezelWidth", 12.0)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsGlassThickness, "LockscreenQuickActions.GlassThickness", 80.0)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsRefractionScale, "LockscreenQuickActions.RefractionScale", 1.2)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsRefractiveIndex, "LockscreenQuickActions.RefractiveIndex", 1.0)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsSpecularOpacity, "LockscreenQuickActions.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsBlur, "LockscreenQuickActions.Blur", 8.0)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsWallpaperScale, "LockscreenQuickActions.WallpaperScale", 0.5)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsLightTintAlpha, "LockscreenQuickActions.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGLockscreenQuickActionsDarkTintAlpha, "LockscreenQuickActions.DarkTintAlpha", 0.0)
 
 static void LGLockscreenQuickActionsResetHost(UIView *view) {
     LGCleanupLockscreenHost(view);

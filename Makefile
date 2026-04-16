@@ -1,17 +1,22 @@
 # build for a real device then: make package ARCHS="arm64 arm64e" TARGET="iphone:clang:latest:14.0" FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless/roothide
 
-export TARGET := simulator:clang:latest:14.0
-export ARCHS := x86_64
-export GO_EASY_ON_ME=1
+ifeq ($(filter sim,$(MAKECMDGOALS)),sim)
+export TARGET ?= simulator:clang:latest:14.0
+export ARCHS ?= x86_64
+else
+export TARGET ?= iphone:clang:latest:14.0
+export ARCHS ?= arm64 arm64e
+endif
 
 include $(THEOS)/makefiles/common.mk
 include ./locatesim.mk
 
 TWEAK_NAME = liquidass
 HOOK_FILES := $(wildcard Hooks/*.x) $(wildcard Hooks/Lockscreen/*.x)
-SHARED_FILES := Shared/LGMetalShaderSource.m Shared/LGGlassRenderer.m
+SHARED_FILES := Shared/LGSharedSupport.m Shared/LGHookSupport.m Shared/LGBannerCaptureSupport.m Shared/LGMetalShaderSource.m Shared/LGGlassRenderer.m
+RUNTIME_FILES := Runtime/LGLiquidGlassRuntime.m Runtime/LGSnapshotCaptureSupport.m
 PREF_CONTROL_FILES := LiquidAssPrefs/LGPrefsLiquidSlider.m LiquidAssPrefs/LGPrefsLiquidSwitch.m
-$(TWEAK_NAME)_FILES = Tweak.x $(HOOK_FILES) $(SHARED_FILES) $(PREF_CONTROL_FILES)
+$(TWEAK_NAME)_FILES = Tweak.x $(HOOK_FILES) $(SHARED_FILES) $(RUNTIME_FILES) $(PREF_CONTROL_FILES)
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc
 $(TWEAK_NAME)_FRAMEWORKS = UIKit MetalKit
 

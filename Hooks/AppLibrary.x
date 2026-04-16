@@ -1,7 +1,8 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 
 static void startAppLibDisplayLink(void);
 static void stopAppLibDisplayLink(void);
@@ -12,91 +13,162 @@ static UIView *LGAppLibraryPodHostView(UIView *view);
 static void LGAppLibraryPreparePodChildren(UIView *host);
 static void LGEnsureAppLibraryTintOverlay(UIView *host, CGFloat cornerRadius, UIColor *tintColor);
 static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly);
-
-@interface LGAppLibTicker : NSObject
-- (void)tick:(CADisplayLink *)dl;
-@end
-@implementation LGAppLibTicker
-- (void)tick:(CADisplayLink *)dl {
-    LG_updateRegisteredGlassViews(LGUpdateGroupAppLibrary);
-}
-@end
+static BOOL LGIsAppLibraryFocusIsolationMaterial(UIView *view);
 
 static CADisplayLink  *sAppLibLink   = nil;
-static LGAppLibTicker *sAppLibTicker = nil;
+static id sAppLibTicker = nil;
 static void *kAppLibRetryKey = &kAppLibRetryKey;
 static void *kAppLibOriginalAlphaKey = &kAppLibOriginalAlphaKey;
 static void *kAppLibOriginalCornerRadiusKey = &kAppLibOriginalCornerRadiusKey;
 static void *kAppLibOriginalClipsKey = &kAppLibOriginalClipsKey;
 static void *kAppLibGlassKey = &kAppLibGlassKey;
 static void *kAppLibTintKey = &kAppLibTintKey;
-static BOOL LGAppLibraryEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"AppLibrary.Enabled", YES); }
-static CGFloat LGAppLibCornerRadius(void) { return LG_prefFloat(@"AppLibrary.CornerRadius", 20.2); }
-static CGFloat LGAppLibBezelWidth(void) { return LG_prefFloat(@"AppLibrary.BezelWidth", 18.0); }
-static CGFloat LGAppLibGlassThickness(void) { return LG_prefFloat(@"AppLibrary.GlassThickness", 150.0); }
-static CGFloat LGAppLibRefractionScale(void) { return LG_prefFloat(@"AppLibrary.RefractionScale", 1.8); }
-static CGFloat LGAppLibRefractiveIndex(void) { return LG_prefFloat(@"AppLibrary.RefractiveIndex", 1.2); }
-static CGFloat LGAppLibSpecularOpacity(void) { return LG_prefFloat(@"AppLibrary.SpecularOpacity", 0.8); }
-static CGFloat LGAppLibBlur(void) { return LG_prefFloat(@"AppLibrary.Blur", 25.0); }
-static CGFloat LGAppLibWallpaperScale(void) { return LG_prefFloat(@"AppLibrary.WallpaperScale", 0.1); }
-static CGFloat LGAppLibLightTintAlpha(void) { return LG_prefFloat(@"AppLibrary.LightTintAlpha", 0.1); }
-static CGFloat LGAppLibDarkTintAlpha(void) { return LG_prefFloat(@"AppLibrary.DarkTintAlpha", 0.0); }
-static CGFloat LGAppLibSearchCornerRadius(void) { return LG_prefFloat(@"AppLibrary.SearchCornerRadius", 24.0); }
-static CGFloat LGAppLibSearchBezelWidth(void) { return LG_prefFloat(@"AppLibrary.SearchBezelWidth", 16.0); }
-static CGFloat LGAppLibSearchGlassThickness(void) { return LG_prefFloat(@"AppLibrary.SearchGlassThickness", 100.0); }
-static CGFloat LGAppLibSearchRefractionScale(void) { return LG_prefFloat(@"AppLibrary.SearchRefractionScale", 1.5); }
-static CGFloat LGAppLibSearchRefractiveIndex(void) { return LG_prefFloat(@"AppLibrary.SearchRefractiveIndex", 1.5); }
-static CGFloat LGAppLibSearchSpecularOpacity(void) { return LG_prefFloat(@"AppLibrary.SearchSpecularOpacity", 0.8); }
-static CGFloat LGAppLibSearchBlur(void) { return LG_prefFloat(@"AppLibrary.SearchBlur", 25.0); }
-static CGFloat LGAppLibSearchWallpaperScale(void) { return LG_prefFloat(@"AppLibrary.SearchWallpaperScale", 0.1); }
-static CGFloat LGAppLibSearchLightTintAlpha(void) { return LG_prefFloat(@"AppLibrary.SearchLightTintAlpha", 0.1); }
-static CGFloat LGAppLibSearchDarkTintAlpha(void) { return LG_prefFloat(@"AppLibrary.SearchDarkTintAlpha", 0.0); }
+static void *kAppLibFocusResanitizePendingKey = &kAppLibFocusResanitizePendingKey;
+LG_ENABLED_BOOL_PREF_FUNC(LGAppLibraryEnabled, "AppLibrary.Enabled", YES)
+LG_BOOL_PREF_FUNC(LGAppLibraryUseIconSnapshot, "AppLibrary.CompositeSnapshot", NO)
+LG_FLOAT_PREF_FUNC(LGAppLibCornerRadius, "AppLibrary.CornerRadius", 20.2)
+LG_FLOAT_PREF_FUNC(LGAppLibBezelWidth, "AppLibrary.BezelWidth", 18.0)
+LG_FLOAT_PREF_FUNC(LGAppLibGlassThickness, "AppLibrary.GlassThickness", 150.0)
+LG_FLOAT_PREF_FUNC(LGAppLibRefractionScale, "AppLibrary.RefractionScale", 1.8)
+LG_FLOAT_PREF_FUNC(LGAppLibRefractiveIndex, "AppLibrary.RefractiveIndex", 1.2)
+LG_FLOAT_PREF_FUNC(LGAppLibSpecularOpacity, "AppLibrary.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGAppLibBlur, "AppLibrary.Blur", 25.0)
+LG_FLOAT_PREF_FUNC(LGAppLibWallpaperScale, "AppLibrary.WallpaperScale", 0.1)
+LG_FLOAT_PREF_FUNC(LGAppLibLightTintAlpha, "AppLibrary.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGAppLibDarkTintAlpha, "AppLibrary.DarkTintAlpha", 0.0)
+LG_ENABLED_BOOL_PREF_FUNC(LGAppLibSearchEnabled, "AppLibrary.Search.Enabled", YES)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchCornerRadius, "AppLibrary.SearchCornerRadius", 24.0)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchBezelWidth, "AppLibrary.SearchBezelWidth", 16.0)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchGlassThickness, "AppLibrary.SearchGlassThickness", 100.0)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchRefractionScale, "AppLibrary.SearchRefractionScale", 1.5)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchRefractiveIndex, "AppLibrary.SearchRefractiveIndex", 1.5)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchSpecularOpacity, "AppLibrary.SearchSpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchBlur, "AppLibrary.SearchBlur", 25.0)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchWallpaperScale, "AppLibrary.SearchWallpaperScale", 0.1)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchLightTintAlpha, "AppLibrary.SearchLightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGAppLibSearchDarkTintAlpha, "AppLibrary.SearchDarkTintAlpha", 0.0)
 
-static NSInteger LGAppLibraryPreferredFPS(void) {
-    NSInteger maxFPS = UIScreen.mainScreen.maximumFramesPerSecond > 0
-        ? UIScreen.mainScreen.maximumFramesPerSecond
-        : 60;
-    NSInteger fps = LG_prefInteger(@"AppLibrary.FPS", maxFPS >= 120 ? 120 : 60);
-    if (fps < 30) fps = 30;
-    if (fps > maxFPS) fps = maxFPS;
-    return fps;
+static BOOL LGAnyAppLibraryGlassEnabled(void) {
+    return LGAppLibraryEnabled() || LGAppLibSearchEnabled();
+}
+
+static BOOL LGFilterLooksLikeTintFilter(id filter) {
+    NSString *name = nil;
+    @try {
+        name = [filter valueForKey:@"name"];
+    } @catch (__unused NSException *exception) {
+        name = nil;
+    }
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    NSString *lower = name.lowercaseString;
+    return ([lower containsString:@"vibrant"] ||
+            [lower containsString:@"colormatrix"]);
+}
+
+static NSArray *LGCleanedFilterArray(NSArray *filters, BOOL *didRemoveAny) {
+    if (!filters.count) return filters;
+    NSMutableArray *cleaned = [NSMutableArray arrayWithCapacity:filters.count];
+    BOOL removed = NO;
+    for (id filter in filters) {
+        if (LGFilterLooksLikeTintFilter(filter)) {
+            removed = YES;
+            continue;
+        }
+        [cleaned addObject:filter];
+    }
+    if (didRemoveAny) *didRemoveAny = removed;
+    return removed ? cleaned : filters;
+}
+
+static void stripTintFiltersFromLayerTree(CALayer *layer) {
+    if (!layer) return;
+
+    BOOL removedMain = NO;
+    NSArray *mainFilters = LGCleanedFilterArray(layer.filters, &removedMain);
+    if (removedMain) layer.filters = mainFilters;
+
+    @try {
+        id rawBackgroundFilters = [layer valueForKey:@"backgroundFilters"];
+        if ([rawBackgroundFilters isKindOfClass:[NSArray class]]) {
+            BOOL removedBg = NO;
+            NSArray *cleanedBg = LGCleanedFilterArray((NSArray *)rawBackgroundFilters, &removedBg);
+            if (removedBg) [layer setValue:cleanedBg forKey:@"backgroundFilters"];
+        }
+    } @catch (__unused NSException *exception) {
+    }
+
+    layer.compositingFilter = nil;
+
+    for (CALayer *sub in layer.sublayers) {
+        stripTintFiltersFromLayerTree(sub);
+    }
 }
 
 static void stripFocusMaterialFiltersIfNeeded(UIView *view) {
-    NSArray *filters = view.layer.filters;
-    if (filters.count) {
-        NSMutableArray *cleaned = [NSMutableArray arrayWithCapacity:filters.count];
-        BOOL found = NO;
-        for (id f in filters) {
-            NSString *name = [f valueForKey:@"name"];
-            if ([name containsString:@"ibrant"] || [name containsString:@"olorMatrix"])
-                found = YES;
-            else
-                [cleaned addObject:f];
+    stripTintFiltersFromLayerTree(view.layer);
+}
+
+static BOOL LGHasDescendantClassNamed(UIView *root, NSString *className) {
+    if (!root || className.length == 0) return NO;
+    __block BOOL found = NO;
+    LGTraverseViews(root, ^(UIView *view) {
+        if (found) return;
+        if ([NSStringFromClass(view.class) isEqualToString:className]) {
+            found = YES;
         }
-        if (found) view.layer.filters = cleaned;
+    });
+    return found;
+}
+
+static BOOL LGIsSidebarLibraryMarkerView(UIView *view) {
+    if (!view) return NO;
+    return LGHasDescendantClassNamed(view, LGAppLibrarySidebarMarkerClassName);
+}
+
+static BOOL LGContainerHasSidebarLibrarySibling(UIView *container, UIView *excluded) {
+    if (!container) return NO;
+    for (UIView *sibling in container.subviews) {
+        if (sibling == excluded) continue;
+        if (LGIsSidebarLibraryMarkerView(sibling)) return YES;
     }
-    view.layer.compositingFilter = nil;
+    return NO;
+}
+
+static BOOL LGIsAppLibraryFocusIsolationMaterial(UIView *view) {
+    static Class focusCls;
+    if (!focusCls) focusCls = NSClassFromString(@"SBFFocusIsolationView");
+    UIView *focusView = view.superview;
+    BOOL directFocusChild = focusCls && [focusView isKindOfClass:focusCls];
+    BOOL hasSidebarSibling = directFocusChild && LGContainerHasSidebarLibrarySibling(focusView, view);
+    if (!directFocusChild) return NO;
+    return hasSidebarSibling;
+}
+
+static void LGScheduleFocusResanitize(UIView *view) {
+    if (!view) return;
+    if ([objc_getAssociatedObject(view, kAppLibFocusResanitizePendingKey) boolValue]) return;
+    objc_setAssociatedObject(view, kAppLibFocusResanitizePendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(view, kAppLibFocusResanitizePendingKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (!view.window) return;
+        if (!LGIsAppLibraryFocusIsolationMaterial(view)) return;
+        stripFocusMaterialFiltersIfNeeded(view);
+    });
 }
 
 static void startAppLibDisplayLink(void) {
-    if (!LGAppLibraryEnabled()) return;
-    if (sAppLibLink) return;
-    sAppLibTicker = [LGAppLibTicker new];
-    sAppLibLink   = [CADisplayLink displayLinkWithTarget:sAppLibTicker
-                                               selector:@selector(tick:)];
-    if ([sAppLibLink respondsToSelector:@selector(setPreferredFramesPerSecond:)])
-        sAppLibLink.preferredFramesPerSecond = LGAppLibraryPreferredFPS();
-    [sAppLibLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    if (!LGAnyAppLibraryGlassEnabled()) return;
+    LGStartDisplayLink(&sAppLibLink, &sAppLibTicker, LGPreferredFramesPerSecondForKey(@"AppLibrary.FPS", 30), ^{
+        LG_updateRegisteredGlassViews(LGUpdateGroupAppLibrary);
+    });
 }
 static void stopAppLibDisplayLink(void) {
-    [sAppLibLink invalidate];
-    sAppLibLink = nil;
-    sAppLibTicker = nil;
+    LGStopDisplayLink(&sAppLibLink, &sAppLibTicker);
 }
 
 static void LGSyncAppLibraryDisplayLink(void) {
-    if (LGAppLibraryEnabled()) startAppLibDisplayLink();
+    if (LGAnyAppLibraryGlassEnabled()) startAppLibDisplayLink();
     else stopAppLibDisplayLink();
 }
 
@@ -119,39 +191,28 @@ static void LGAppLibraryRestoreOriginalState(UIView *view) {
 }
 
 static void LGRemoveAppLibraryGlass(UIView *view) {
-    UIView *tint = objc_getAssociatedObject(view, kAppLibTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(view, kAppLibTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(view, kAppLibTintKey);
     LiquidGlassView *glass = objc_getAssociatedObject(view, kAppLibGlassKey);
     if (glass) [glass removeFromSuperview];
     objc_setAssociatedObject(view, kAppLibGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
 static UIColor *LGAppLibraryTintColorForView(UIView *view, CGFloat lightAlpha, CGFloat darkAlpha) {
-    if (@available(iOS 12.0, *)) {
-        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
-        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [UIColor colorWithWhite:0.0 alpha:darkAlpha];
-    }
-    return [UIColor colorWithWhite:1.0 alpha:lightAlpha];
+    return LGDefaultTintColorForView(view, lightAlpha, darkAlpha);
 }
 
 static void LGEnsureAppLibraryTintOverlay(UIView *host, CGFloat cornerRadius, UIColor *tintColor) {
     if (!host) return;
-    UIView *tint = objc_getAssociatedObject(host, kAppLibTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:host.bounds];
-        tint.userInteractionEnabled = NO;
-        tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        objc_setAssociatedObject(host, kAppLibTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [host addSubview:tint];
-    }
-    tint.frame = host.bounds;
-    tint.backgroundColor = tintColor;
-    tint.layer.cornerRadius = cornerRadius;
-    if (@available(iOS 13.0, *))
-        tint.layer.cornerCurve = host.layer.cornerCurve;
-    tint.hidden = (tintColor == nil);
+    UIView *tint = LGEnsureTintOverlayView(host,
+                                           kAppLibTintKey,
+                                           0,
+                                           host.bounds,
+                                           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
+    LGConfigureTintOverlayView(tint,
+                               tintColor,
+                               cornerRadius,
+                               host.layer,
+                               NO);
     [host bringSubviewToFront:tint];
 }
 
@@ -218,6 +279,17 @@ static void LGAppLibraryConfigureGlass(LiquidGlassView *glass,
     glass.updateGroup = LGUpdateGroupAppLibrary;
 }
 
+static UIImage *LGAppLibraryCompositeSnapshot(void) {
+    if (!LGAppLibraryUseIconSnapshot()) {
+        return LG_getHomescreenSnapshot(NULL);
+    }
+    UIImage *snapshot = LG_getStrictCachedContextMenuSnapshot();
+    if (snapshot) return snapshot;
+    LG_cacheContextMenuSnapshot();
+    snapshot = LG_getStrictCachedContextMenuSnapshot();
+    return snapshot ?: LG_getContextMenuSnapshot();
+}
+
 static void injectIntoAppLibrary(UIView *self_) {
     UIView *host = LGAppLibraryPodHostView(self_);
     if (!LGAppLibraryEnabled()) {
@@ -227,7 +299,7 @@ static void injectIntoAppLibrary(UIView *self_) {
     startAppLibDisplayLink();
 
     CGPoint wallpaperOrigin = CGPointZero;
-    UIImage *snapshot = LG_getHomescreenSnapshot(&wallpaperOrigin);
+    UIImage *snapshot = LGAppLibraryCompositeSnapshot();
     if (!snapshot) {
         LGAppLibraryRestoreOriginalState(host);
         LGAppLibraryScheduleRetry(host, ^{
@@ -270,7 +342,7 @@ static void injectIntoAppLibrary(UIView *self_) {
 }
 
 static void injectIntoSearchBar(UIView *self_) {
-    if (!LGAppLibraryEnabled()) {
+    if (!LGAppLibSearchEnabled()) {
         LGRemoveAppLibraryGlass(self_);
         LGAppLibraryRestoreOriginalState(self_);
         return;
@@ -278,7 +350,7 @@ static void injectIntoSearchBar(UIView *self_) {
     startAppLibDisplayLink();
 
     CGPoint wallpaperOrigin = CGPointZero;
-    UIImage *snapshot = LG_getHomescreenSnapshot(&wallpaperOrigin);
+    UIImage *snapshot = LGAppLibraryCompositeSnapshot();
     if (!snapshot) {
         LGAppLibraryRestoreOriginalState(self_);
         LGAppLibraryScheduleRetry(self_, ^{
@@ -319,16 +391,10 @@ static void injectIntoSearchBar(UIView *self_) {
     [glass updateOrigin];
 }
 
-static void LGAppLibraryTraverseViews(UIView *root, void (^block)(UIView *view)) {
-    if (!root) return;
-    block(root);
-    for (UIView *sub in root.subviews) LGAppLibraryTraverseViews(sub, block);
-}
-
 static void LGAppLibraryRefreshAllHosts(void) {
     UIApplication *app = UIApplication.sharedApplication;
     void (^refreshWindow)(UIWindow *) = ^(UIWindow *window) {
-        LGAppLibraryTraverseViews(window, ^(UIView *view) {
+        LGTraverseViews(window, ^(UIView *view) {
             if ([NSStringFromClass(view.class) isEqualToString:@"SBHLibraryCategoryPodBackgroundView"]) {
                 injectIntoAppLibrary(view);
                 return;
@@ -344,7 +410,7 @@ static void LGAppLibraryRefreshAllHosts(void) {
             for (UIWindow *window in ((UIWindowScene *)scene).windows) refreshWindow(window);
         }
     } else {
-        for (UIWindow *window in [app valueForKey:@"windows"]) refreshWindow(window);
+        for (UIWindow *window in LGApplicationWindows(app)) refreshWindow(window);
     }
 }
 
@@ -372,7 +438,7 @@ static BOOL isInsideSearchTextField(UIView *view) {
 
 static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
     if (!isInsideSearchTextField(view)) return NO;
-    if (!view.window || !LGAppLibraryEnabled()) {
+    if (!view.window || !LGAppLibSearchEnabled()) {
         LGRemoveAppLibraryGlass(view);
         LGAppLibraryRestoreOriginalState(view);
         return YES;
@@ -387,6 +453,8 @@ static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
     LGAppLibraryPrepareHost(view, LGAppLibSearchCornerRadius());
     return YES;
 }
+
+%group LGAppLibrarySpringBoard
 
 %hook SBHLibraryCategoryPodBackgroundView
 
@@ -429,18 +497,6 @@ static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
 
 %end
 
-%ctor {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
-                                    LGAppLibraryPrefsChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        LGSyncAppLibraryDisplayLink();
-    });
-}
-
 %hook MTMaterialView
 
 - (void)didMoveToWindow {
@@ -450,14 +506,15 @@ static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
     if (LGHandleSearchFieldMaterialView(self_, NO)) return;
 
     if (!self_.window) return;
-    if (!LGAppLibraryEnabled()) return;
+    if (!LGAnyAppLibraryGlassEnabled()) return;
     static Class focusCls, podCls;
     if (!focusCls) focusCls = NSClassFromString(@"SBFFocusIsolationView");
     if (!podCls)   podCls   = NSClassFromString(@"SBHLibraryCategoryPodBackgroundView");
     UIView *v = self_.superview;
     while (v) {
-        if ([v isKindOfClass:focusCls]) {
+        if ([v isKindOfClass:focusCls] && LGIsAppLibraryFocusIsolationMaterial(self_)) {
             stripFocusMaterialFiltersIfNeeded(self_);
+            LGScheduleFocusResanitize(self_);
             return;
         }
         if ([v isKindOfClass:podCls]) return;
@@ -471,14 +528,15 @@ static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
 
     if (LGHandleSearchFieldMaterialView(self_, YES)) return;
 
-    if (!LGAppLibraryEnabled()) return;
+    if (!LGAnyAppLibraryGlassEnabled()) return;
     static Class focusCls2, podCls2;
     if (!focusCls2) focusCls2 = NSClassFromString(@"SBFFocusIsolationView");
     if (!podCls2)   podCls2   = NSClassFromString(@"SBHLibraryCategoryPodBackgroundView");
     UIView *v = self_.superview;
     while (v) {
-        if ([v isKindOfClass:focusCls2]) {
+        if ([v isKindOfClass:focusCls2] && LGIsAppLibraryFocusIsolationMaterial(self_)) {
             stripFocusMaterialFiltersIfNeeded(self_);
+            LGScheduleFocusResanitize(self_);
             return;
         }
         if ([v isKindOfClass:podCls2]) return;
@@ -496,3 +554,16 @@ static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
 }
 
 %end
+
+%end
+
+%ctor {
+    if (!LGIsSpringBoardProcess()) return;
+    LGObservePreferenceChanges(^{
+        LGAppLibraryPrefsChanged(NULL, NULL, NULL, NULL, NULL);
+    });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LGSyncAppLibraryDisplayLink();
+    });
+    %init(LGAppLibrarySpringBoard);
+}

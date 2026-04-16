@@ -1,4 +1,6 @@
 #import "../LiquidGlass.h"
+#import "../Shared/LGHookSupport.h"
+#import "../Shared/LGPrefAccessors.h"
 #import <objc/runtime.h>
 
 static const NSTimeInterval kFolderOpenDisplayLinkGrace = 0.18;
@@ -7,7 +9,7 @@ static void *kFolderOpenOriginalAlphaKey = &kFolderOpenOriginalAlphaKey;
 static void *kFolderOpenAttachedKey = &kFolderOpenAttachedKey;
 static void *kFolderOpenGlassKey = &kFolderOpenGlassKey;
 static void *kFolderOpenTintKey = &kFolderOpenTintKey;
-static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
+static void *kFolderOpenResanitizePendingKey = &kFolderOpenResanitizePendingKey;
 
 static BOOL isInsideOpenFolder(UIView *view) {
     static Class cls;
@@ -34,7 +36,6 @@ static UIView *folderOpenContainerForView(UIView *view) {
 static void stopFolderDisplayLink(void);
 static void scheduleFolderDisplayLinkStopIfIdle(void);
 static void LGFolderOpenRefreshAllHosts(void);
-static void LGFolderOpenTraverseViews(UIView *root, void (^block)(UIView *view));
 static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view));
 static void LGRestoreFolderOpenHost(UIView *view);
 static void LGDetachFolderOpenHost(UIView *view);
@@ -42,74 +43,122 @@ static void LGHandleFolderOpenMaterialView(UIView *view, BOOL updateOnly);
 
 static NSInteger sFolderCount = 0;
 static NSUInteger sFolderStopGeneration = 0;
-static BOOL LGFolderOpenEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"FolderOpen.Enabled", YES); }
-static CGFloat LGFolderOpenCornerRadius(void) { return LG_prefFloat(@"FolderOpen.CornerRadius", 38.0); }
-static CGFloat LGFolderOpenBezelWidth(void) { return LG_prefFloat(@"FolderOpen.BezelWidth", 24.0); }
-static CGFloat LGFolderOpenGlassThickness(void) { return LG_prefFloat(@"FolderOpen.GlassThickness", 100.0); }
-static CGFloat LGFolderOpenRefractionScale(void) { return LG_prefFloat(@"FolderOpen.RefractionScale", 1.8); }
-static CGFloat LGFolderOpenRefractiveIndex(void) { return LG_prefFloat(@"FolderOpen.RefractiveIndex", 1.2); }
-static CGFloat LGFolderOpenSpecularOpacity(void) { return LG_prefFloat(@"FolderOpen.SpecularOpacity", 0.8); }
-static CGFloat LGFolderOpenBlur(void) { return LG_prefFloat(@"FolderOpen.Blur", 25.0); }
-static CGFloat LGFolderOpenWallpaperScale(void) { return LG_prefFloat(@"FolderOpen.WallpaperScale", 0.1); }
-static CGFloat LGFolderOpenLightTintAlpha(void) { return LG_prefFloat(@"FolderOpen.LightTintAlpha", 0.1); }
-static CGFloat LGFolderOpenDarkTintAlpha(void) { return LG_prefFloat(@"FolderOpen.DarkTintAlpha", 0.0); }
+LG_ENABLED_BOOL_PREF_FUNC(LGFolderOpenEnabled, "FolderOpen.Enabled", YES)
+LG_FLOAT_PREF_FUNC(LGFolderOpenCornerRadius, "FolderOpen.CornerRadius", 38.0)
+LG_FLOAT_PREF_FUNC(LGFolderOpenBezelWidth, "FolderOpen.BezelWidth", 24.0)
+LG_FLOAT_PREF_FUNC(LGFolderOpenGlassThickness, "FolderOpen.GlassThickness", 100.0)
+LG_FLOAT_PREF_FUNC(LGFolderOpenRefractionScale, "FolderOpen.RefractionScale", 1.8)
+LG_FLOAT_PREF_FUNC(LGFolderOpenRefractiveIndex, "FolderOpen.RefractiveIndex", 1.2)
+LG_FLOAT_PREF_FUNC(LGFolderOpenSpecularOpacity, "FolderOpen.SpecularOpacity", 0.8)
+LG_FLOAT_PREF_FUNC(LGFolderOpenBlur, "FolderOpen.Blur", 25.0)
+LG_FLOAT_PREF_FUNC(LGFolderOpenWallpaperScale, "FolderOpen.WallpaperScale", 0.1)
+LG_FLOAT_PREF_FUNC(LGFolderOpenLightTintAlpha, "FolderOpen.LightTintAlpha", 0.1)
+LG_FLOAT_PREF_FUNC(LGFolderOpenDarkTintAlpha, "FolderOpen.DarkTintAlpha", 0.0)
 
 static UIColor *folderOpenTintColorForView(UIView *view) {
-    if (@available(iOS 12.0, *)) {
-        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
-        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
-            return [UIColor colorWithWhite:0.0 alpha:LGFolderOpenDarkTintAlpha()];
+    return LGDefaultTintColorForView(view, LGFolderOpenLightTintAlpha(), LGFolderOpenDarkTintAlpha());
+}
+
+static BOOL LGFolderOpenFilterLooksLikeTintFilter(id filter) {
+    NSString *name = nil;
+    @try {
+        name = [filter valueForKey:@"name"];
+    } @catch (__unused NSException *exception) {
+        name = nil;
     }
-    return [UIColor colorWithWhite:1.0 alpha:LGFolderOpenLightTintAlpha()];
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    NSString *lower = name.lowercaseString;
+    return ([lower containsString:@"vibrant"] ||
+            [lower containsString:@"colormatrix"]);
+}
+
+static NSArray *LGFolderOpenCleanedFilterArray(NSArray *filters, BOOL *didRemoveAny) {
+    if (!filters.count) return filters;
+    NSMutableArray *cleaned = [NSMutableArray arrayWithCapacity:filters.count];
+    BOOL removed = NO;
+    for (id filter in filters) {
+        if (LGFolderOpenFilterLooksLikeTintFilter(filter)) {
+            removed = YES;
+            continue;
+        }
+        [cleaned addObject:filter];
+    }
+    if (didRemoveAny) *didRemoveAny = removed;
+    return removed ? cleaned : filters;
+}
+
+static void LGStripFolderOpenTintFiltersFromLayerTree(CALayer *layer) {
+    if (!layer) return;
+
+    BOOL removedMain = NO;
+    NSArray *mainFilters = LGFolderOpenCleanedFilterArray(layer.filters, &removedMain);
+    if (removedMain) layer.filters = mainFilters;
+
+    @try {
+        id rawBackgroundFilters = [layer valueForKey:@"backgroundFilters"];
+        if ([rawBackgroundFilters isKindOfClass:[NSArray class]]) {
+            BOOL removedBg = NO;
+            NSArray *cleanedBg = LGFolderOpenCleanedFilterArray((NSArray *)rawBackgroundFilters, &removedBg);
+            if (removedBg) [layer setValue:cleanedBg forKey:@"backgroundFilters"];
+        }
+    } @catch (__unused NSException *exception) {
+    }
+
+    layer.compositingFilter = nil;
+
+    for (CALayer *sub in layer.sublayers) {
+        LGStripFolderOpenTintFiltersFromLayerTree(sub);
+    }
+}
+
+static BOOL LGIsFolderControllerBackgroundMaterial(UIView *view) {
+    return view && [NSStringFromClass(view.superview.class) isEqualToString:@"SBFolderControllerBackgroundView"];
+}
+
+static void LGStripFolderOpenMaterialFiltersIfNeeded(UIView *view) {
+    if (!LGIsFolderControllerBackgroundMaterial(view)) return;
+    LGStripFolderOpenTintFiltersFromLayerTree(view.layer);
+}
+
+static void LGScheduleFolderOpenResanitize(UIView *view) {
+    if (!view || !LGIsFolderControllerBackgroundMaterial(view)) return;
+    if ([objc_getAssociatedObject(view, kFolderOpenResanitizePendingKey) boolValue]) return;
+    objc_setAssociatedObject(view, kFolderOpenResanitizePendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(view, kFolderOpenResanitizePendingKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (!view.window) return;
+        LGStripFolderOpenMaterialFiltersIfNeeded(view);
+    });
 }
 
 static void ensureFolderOpenTintOverlay(UIView *view) {
-    UIView *tint = objc_getAssociatedObject(view, kFolderOpenTintKey);
-    if (!tint) {
-        tint = [[UIView alloc] initWithFrame:view.bounds];
-        tint.tag = kFolderOpenTintTag;
-        tint.userInteractionEnabled = NO;
-        tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [view addSubview:tint];
-        objc_setAssociatedObject(view, kFolderOpenTintKey, tint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    tint.frame = view.bounds;
-    tint.backgroundColor = folderOpenTintColorForView(view);
-    tint.layer.cornerRadius = LGFolderOpenCornerRadius();
-    if (@available(iOS 13.0, *))
-        tint.layer.cornerCurve = view.layer.cornerCurve;
+    UIView *tint = LGEnsureTintOverlayView(view,
+                                           kFolderOpenTintKey,
+                                           kFolderOpenTintTag,
+                                           view.bounds,
+                                           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
+    LGConfigureTintOverlayView(tint,
+                               folderOpenTintColorForView(view),
+                               LGFolderOpenCornerRadius(),
+                               view.layer,
+                               NO);
     [view bringSubviewToFront:tint];
 }
 
-@interface LGFolderTicker : NSObject
-- (void)tick:(CADisplayLink *)dl;
-@end
-
-@implementation LGFolderTicker
-- (void)tick:(CADisplayLink *)dl {
-    LG_updateRegisteredGlassViews(LGUpdateGroupFolderOpen);
-}
-@end
-
 static CADisplayLink *sFolderLink = nil;
-static LGFolderTicker *sFolderTicker = nil;
+static id sFolderTicker = nil;
 
 static void startFolderDisplayLink(void) {
     sFolderStopGeneration++;
-    if (sFolderLink) return;
-    sFolderTicker = [LGFolderTicker new];
-    sFolderLink = [CADisplayLink displayLinkWithTarget:sFolderTicker selector:@selector(tick:)];
-    if ([sFolderLink respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
-        sFolderLink.preferredFramesPerSecond = LG_prefInteger(@"Homescreen.FPS", 60);
-    }
-    [sFolderLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    LGStartDisplayLink(&sFolderLink, &sFolderTicker, LGPreferredFramesPerSecondForKey(@"Homescreen.FPS", 30), ^{
+        LG_updateRegisteredGlassViews(LGUpdateGroupFolderOpen);
+    });
 }
 
 static void stopFolderDisplayLink(void) {
     sFolderStopGeneration++;
-    [sFolderLink invalidate];
-    sFolderLink = nil;
-    sFolderTicker = nil;
+    LGStopDisplayLink(&sFolderLink, &sFolderTicker);
 }
 
 static void scheduleFolderDisplayLinkStopIfIdle(void) {
@@ -127,7 +176,7 @@ static UIView *LGPrimaryFolderOpenHostForContainer(UIView *container) {
     __block UIView *bestView = nil;
     __block CGFloat bestArea = 0.0;
     Class materialCls = NSClassFromString(@"MTMaterialView");
-    LGFolderOpenTraverseViews(container, ^(UIView *view) {
+    LGTraverseViews(container, ^(UIView *view) {
         if (view == container) return;
         if (!materialCls || ![view isKindOfClass:materialCls]) return;
         if (view.hidden || view.alpha <= 0.01f || view.layer.opacity <= 0.01f) return;
@@ -149,9 +198,7 @@ static BOOL LGIsPrimaryFolderOpenHost(UIView *view) {
 }
 
 static void LGRestoreFolderOpenHost(UIView *view) {
-    UIView *tint = objc_getAssociatedObject(view, kFolderOpenTintKey);
-    if (tint) [tint removeFromSuperview];
-    objc_setAssociatedObject(view, kFolderOpenTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    LGRemoveAssociatedSubview(view, kFolderOpenTintKey);
 
     LiquidGlassView *glass = objc_getAssociatedObject(view, kFolderOpenGlassKey);
     if (glass) [glass removeFromSuperview];
@@ -216,7 +263,9 @@ static void injectIntoOpenFolder(UIView *host) {
     glass.specularOpacity = LGFolderOpenSpecularOpacity();
     glass.blur = LGFolderOpenBlur();
     glass.wallpaperScale = LGFolderOpenWallpaperScale();
+    LGStripFolderOpenMaterialFiltersIfNeeded(host);
     ensureFolderOpenTintOverlay(host);
+    LGScheduleFolderOpenResanitize(host);
     [glass updateOrigin];
 
     if (![objc_getAssociatedObject(host, kFolderOpenAttachedKey) boolValue]) {
@@ -226,12 +275,6 @@ static void injectIntoOpenFolder(UIView *host) {
     startFolderDisplayLink();
 }
 
-static void LGFolderOpenTraverseViews(UIView *root, void (^block)(UIView *view)) {
-    if (!root) return;
-    block(root);
-    for (UIView *sub in root.subviews) LGFolderOpenTraverseViews(sub, block);
-}
-
 static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view)) {
     if (!block) return;
     UIApplication *app = UIApplication.sharedApplication;
@@ -239,7 +282,7 @@ static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view)) {
         for (UIScene *scene in app.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                LGFolderOpenTraverseViews(window, ^(UIView *view) {
+                LGTraverseViews(window, ^(UIView *view) {
                     if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                     if (!isInsideOpenFolder(view)) return;
                     block(view);
@@ -247,8 +290,8 @@ static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view)) {
             }
         }
     } else {
-        for (UIWindow *window in [app valueForKey:@"windows"]) {
-            LGFolderOpenTraverseViews(window, ^(UIView *view) {
+        for (UIWindow *window in LGApplicationWindows(app)) {
+            LGTraverseViews(window, ^(UIView *view) {
                 if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                 if (!isInsideOpenFolder(view)) return;
                 block(view);
@@ -285,7 +328,9 @@ static void LGHandleFolderOpenMaterialView(UIView *view, BOOL updateOnly) {
     glass.specularOpacity = LGFolderOpenSpecularOpacity();
     glass.blur = LGFolderOpenBlur();
     glass.wallpaperScale = LGFolderOpenWallpaperScale();
+    LGStripFolderOpenMaterialFiltersIfNeeded(view);
     [glass updateOrigin];
+    LGScheduleFolderOpenResanitize(view);
 }
 
 static void LGFolderOpenRefreshAllHosts(void) {
@@ -311,6 +356,8 @@ static void LGFolderOpenPrefsChanged(CFNotificationCenterRef center,
     });
 }
 
+%group LGFolderOpenSpringBoard
+
 %hook MTMaterialView
 
 - (void)didMoveToWindow {
@@ -327,11 +374,12 @@ static void LGFolderOpenPrefsChanged(CFNotificationCenterRef center,
 
 %end
 
+%end
+
 %ctor {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL,
-                                    LGFolderOpenPrefsChanged,
-                                    kLGPrefsChangedNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+    if (!LGIsSpringBoardProcess()) return;
+    LGObservePreferenceChanges(^{
+        LGFolderOpenPrefsChanged(NULL, NULL, NULL, NULL, NULL);
+    });
+    %init(LGFolderOpenSpringBoard);
 }
